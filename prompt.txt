@@ -1,0 +1,561 @@
+You are a senior Python staff engineer and architect.
+
+Build a production-quality Python application for a PERSONAL sneaker price tracker and notification system for Indian sneaker/fashion e-commerce platforms.
+
+This is NOT a toy project. The implementation should be clean, modular, extensible, and production-minded, but intentionally lightweight and cheap to run on a small VPS.
+
+The system must be written in Python.
+
+The app will run continuously on a small Linux VPS (Ubuntu) and should use OpenAI APIs where useful.
+
+IMPORTANT DESIGN PHILOSOPHY
+
+1. This is a PERSONAL project, not enterprise SaaS.
+2. Cost optimization matters.
+3. Simplicity matters.
+4. Reliability matters.
+5. Avoid overengineering.
+6. Avoid Kubernetes/microservices.
+7. Prefer local persistence.
+8. Use AI only where it truly adds value.
+9. Scraping logic should NEVER depend on AI.
+10. The system should be extensible enough to support additional agents later.
+
+=========================================
+PRIMARY USE CASE
+=========================================
+
+The system should track sneaker prices and stock across Indian sneaker/fashion e-commerce websites.
+
+Initial target platforms:
+
+- Myntra
+- AJIO
+- TataCliq
+- TataCliq Luxury
+- Flipkart
+- VegNonVeg
+- Superkicks
+- LimitedEdt
+- Footlocker India
+- Brand websites where applicable
+
+The goal is to monitor:
+
+- new sneaker arrivals
+- price changes
+- discounts
+- stock availability
+- restocks
+- size availability
+- product disappearance
+- price drops
+
+The system should eventually support conversational querying and summarization via OpenAI.
+
+Example future questions:
+
+"Has RC42 dropped anywhere?"
+"Show me best deal for NB RC42 under 7k."
+"What new retro runners launched this week?"
+"Where is Gel NYC discounted?"
+
+=========================================
+ARCHITECTURAL REQUIREMENTS
+=========================================
+
+Implement a HYBRID scraping architecture.
+
+PRIORITY ORDER:
+
+1. Hidden API / JSON endpoint discovery
+2. GraphQL endpoints
+3. HTML scraping with Playwright
+4. BeautifulSoup parsing
+
+Avoid Selenium.
+
+Use:
+
+- Playwright
+- BeautifulSoup4
+- requests/httpx
+- sqlite (initially)
+- SQLAlchemy
+- APScheduler
+- OpenAI Python SDK
+- Pydantic
+- structlog or logging
+- tenacity for retries
+
+DO NOT use:
+
+- Redis
+- Celery
+- Kubernetes
+- Kafka
+- external vector databases
+- unnecessary cloud dependencies
+
+Everything should run in Docker Compose on a single VPS.
+
+=========================================
+SCRAPING STRATEGY
+=========================================
+
+For EACH platform:
+
+Step 1:
+Attempt to identify hidden APIs.
+
+The collector should first try:
+
+- JSON APIs
+- GraphQL APIs
+- internal search endpoints
+- catalog endpoints
+- listing endpoints
+
+Inspect browser network requests.
+
+If APIs exist:
+
+Use APIs instead of HTML scraping.
+
+Benefits:
+- faster
+- structured
+- more stable
+- less anti-bot risk
+
+Step 2:
+Fallback to Playwright rendering.
+
+If no usable API exists:
+
+Use Playwright headless Chromium.
+
+Then parse rendered HTML using BeautifulSoup.
+
+DO NOT rely purely on CSS selectors without fallback strategies.
+
+Selectors should be configurable.
+
+=========================================
+ANTI-BOT / SAFE SCRAPING REQUIREMENTS
+=========================================
+
+This is a PERSONAL PROJECT.
+
+The scraper must behave conservatively.
+
+Implement:
+
+1. Random delays between requests.
+
+Example:
+3–15 seconds randomized.
+
+2. Sequential scraping.
+
+DO NOT parallelize aggressively.
+
+3. Browser-like behavior.
+
+Configure:
+
+- realistic Chrome user-agent
+- viewport
+- timezone
+- locale
+- accept-language
+
+4. Retry with exponential backoff.
+
+5. Rate limiting.
+
+6. Respect robots.txt where practical.
+
+7. Graceful degradation.
+
+If a website changes structure:
+do not crash the system.
+
+Log failures and continue.
+
+8. Configurable scan intervals.
+
+=========================================
+TRACKING REQUIREMENTS
+=========================================
+
+Track:
+
+Product identity:
+- brand
+- model
+- product title
+- normalized sneaker name
+- SKU if available
+
+Commerce:
+- listed price
+- discounted price
+- percentage discount
+- currency
+- product URL
+
+Availability:
+- in stock
+- out of stock
+- sizes available
+
+Metadata:
+- platform
+- scrape timestamp
+- first seen timestamp
+- last seen timestamp
+- image URL
+
+Launch intelligence:
+- newly discovered products
+- removed products
+
+=========================================
+DATABASE REQUIREMENTS
+=========================================
+
+Use SQLite initially.
+
+Use SQLAlchemy ORM.
+
+Design schema for future migration to Postgres.
+
+Recommended tables:
+
+platforms
+products
+product_snapshots
+price_history
+size_stock_history
+alerts
+scan_jobs
+
+The database should preserve historical pricing.
+
+I want historical trend analysis later.
+
+=========================================
+NORMALIZATION REQUIREMENTS
+=========================================
+
+VERY IMPORTANT.
+
+Different websites use inconsistent naming.
+
+Examples:
+
+"MEN NEW BALANCE RC42"
+
+"New Balance Men RC42 Sneakers"
+
+"NB RC42"
+
+"RC42 Lifestyle Shoe"
+
+Normalize to:
+
+"New Balance RC42"
+
+Implement deterministic normalization first.
+
+Then AI-assisted normalization as fallback.
+
+=========================================
+OPENAI REQUIREMENTS
+=========================================
+
+Use OpenAI Python SDK.
+
+Use environment variable:
+
+OPENAI_API_KEY
+
+DO NOT use AI for scraping.
+
+AI SHOULD ONLY HELP FOR:
+
+1. Sneaker identity normalization
+2. Duplicate detection
+3. Conversational querying
+4. Intelligent summaries
+5. Recommendation layer later
+
+Preferred model strategy:
+
+Default:
+gpt-4.1-mini
+
+Cheap classification:
+gpt-4.1-nano
+
+Only expensive reasoning when necessary.
+
+Implement abstraction layer:
+
+ai/
+    client.py
+    sneaker_normalizer.py
+    summarizer.py
+
+=========================================
+NOTIFICATION REQUIREMENTS
+=========================================
+
+Initial notification channel:
+
+Telegram bot.
+
+Build Telegram integration.
+
+Notify for:
+
+1. Price drops
+
+Example:
+
+"NB RC42 dropped on AJIO:
+₹6999 → ₹5499"
+
+2. New launch
+
+3. Restock
+
+4. Size availability change
+
+5. Significant discount threshold
+
+Allow configurable thresholds.
+
+Example:
+
+only notify if >10% price drop
+
+=========================================
+SCAN SCHEDULING REQUIREMENTS
+=========================================
+
+Use APScheduler.
+
+Support multiple schedules:
+
+1. General catalog scan:
+every 6 hours
+
+2. Watchlist products:
+every 1 hour
+
+3. Hot release products:
+every 15–30 min
+
+Make scheduling configurable.
+
+=========================================
+CONFIGURATION REQUIREMENTS
+=========================================
+
+Use .env
+
+Configurable:
+
+- OpenAI API key
+- Telegram bot token
+- Telegram chat id
+- scan intervals
+- enabled websites
+- rate limits
+- retry counts
+- logging level
+
+Use pydantic-settings.
+
+=========================================
+PROJECT STRUCTURE
+=========================================
+
+Implement clean modular structure.
+
+Recommended:
+
+app/
+│
+├── collectors/
+│   ├── base.py
+│   ├── myntra.py
+│   ├── ajio.py
+│   ├── tatacliq.py
+│   ├── vegnonveg.py
+│   └── superkicks.py
+│
+├── ai/
+│   ├── client.py
+│   ├── sneaker_normalizer.py
+│   └── summarizer.py
+│
+├── database/
+│   ├── models.py
+│   ├── db.py
+│   └── repositories.py
+│
+├── scheduler/
+│   └── jobs.py
+│
+├── notifier/
+│   └── telegram.py
+│
+├── normalization/
+│   └── sneaker_matcher.py
+│
+├── services/
+│   ├── tracking_service.py
+│   └── diff_service.py
+│
+├── utils/
+│
+├── config.py
+├── main.py
+└── cli.py
+
+=========================================
+COLLECTOR DESIGN REQUIREMENTS
+=========================================
+
+Create a BaseCollector abstract class.
+
+Methods:
+
+discover_products()
+
+fetch_product_details()
+
+normalize_response()
+
+health_check()
+
+Each collector must implement platform-specific logic.
+
+Return normalized Pydantic models.
+
+=========================================
+OBSERVABILITY REQUIREMENTS
+=========================================
+
+Implement proper logging.
+
+Log:
+
+- scan start/end
+- failures
+- selector failures
+- API failures
+- retry attempts
+- discovered products
+- price changes
+
+Include structured logs.
+
+=========================================
+ERROR HANDLING REQUIREMENTS
+=========================================
+
+The system must never fail entirely because one website changed.
+
+If Myntra fails:
+
+AJIO should still run.
+
+Implement per-site failure isolation.
+
+=========================================
+DOCKER REQUIREMENTS
+=========================================
+
+Provide:
+
+Dockerfile
+
+docker-compose.yml
+
+The app should run via:
+
+docker compose up -d
+
+=========================================
+DEVELOPER EXPERIENCE REQUIREMENTS
+=========================================
+
+Include:
+
+Makefile
+
+commands:
+
+make run
+make test
+make lint
+make format
+
+Use:
+
+ruff
+black
+pytest
+
+=========================================
+TESTING REQUIREMENTS
+=========================================
+
+Implement tests for:
+
+1. normalization logic
+2. price diff logic
+3. collector parsing
+4. duplicate detection
+5. scheduler behavior
+
+Mock OpenAI calls.
+
+=========================================
+MVP REQUIREMENTS
+=========================================
+
+Implement MVP first.
+
+MVP websites:
+
+1. Myntra
+2. AJIO
+3. VegNonVeg
+4. Superkicks
+
+Deliver working end-to-end functionality before scaling.
+
+=========================================
+OUTPUT EXPECTATION
+=========================================
+
+Do NOT dump all code at once.
+
+Instead:
+
+1. Propose final architecture
+2. Explain tradeoffs
+3. Generate implementation plan
+4. Create project skeleton
+5. Implement incrementally
+6. Explain decisions
+7. Highlight risks
+
+Prioritize correctness, maintainability, and low operational cost.
+
+Think like a senior engineer building a personal but robust AI-powered automation system.
