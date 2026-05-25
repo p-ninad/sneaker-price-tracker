@@ -56,7 +56,7 @@ dmypy.json
 *.db
 *.sqlite
 *.sqlite3
-data/price_tracker.db
+data/
 
 # Logs
 logs/

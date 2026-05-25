@@ -166,18 +166,74 @@ class TestTelegramNotifier:
             bot_token="test_token",
             chat_id="test_chat"
         )
-        
+
         notifier.bot = AsyncMock()
         # Fail on second call
         notifier.bot.send_message = AsyncMock(
             side_effect=[None, TelegramError("Error"), None]
         )
-        
+
         alerts = [mock_alert, mock_alert, mock_alert]
         result = await notifier.send_alerts_batch(alerts)
-        
+
         assert result["sent_count"] == 2
         assert result["failed_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_send_scan_summary_success(self):
+        """Test sending a scan summary message."""
+        notifier = TelegramNotifier(
+            bot_token="test_token",
+            chat_id="test_chat"
+        )
+
+        notifier.bot = AsyncMock()
+        notifier.bot.send_message = AsyncMock()
+
+        result = await notifier.send_scan_summary(
+            scan_type="watchlist",
+            entries_scanned=3,
+            products_updated=2,
+            alerts_created=1,
+            mismatches=["New Balance 574 mismatch"],
+            errors=["AJIO fetch failed"],
+        )
+
+        assert result is True
+        notifier.bot.send_message.assert_called_once()
+        message = notifier.bot.send_message.call_args.kwargs["text"]
+        assert "Watchlist scan summary" in message
+        assert "Entries scanned: 3" in message
+        assert "Products updated: 2" in message
+        assert "Alerts created: 1" in message
+        assert "New Balance 574 mismatch" in message
+        assert "AJIO fetch failed" in message
+
+    @pytest.mark.asyncio
+    async def test_send_mismatch_alert_success(self):
+        """Test sending a mismatch alert message."""
+        notifier = TelegramNotifier(
+            bot_token="test_token",
+            chat_id="test_chat"
+        )
+
+        notifier.bot = AsyncMock()
+        notifier.bot.send_message = AsyncMock()
+
+        result = await notifier.send_mismatch_alert(
+            source_url="https://www.myntra.com/123",
+            title="New Balance 574",
+            expected="new balance 574",
+            actual="new balance 990",
+        )
+
+        assert result is True
+        notifier.bot.send_message.assert_called_once()
+        message = notifier.bot.send_message.call_args.kwargs["text"]
+        assert "Mismatch Alert" in message
+        assert "https://www.myntra.com/123" in message
+        assert "New Balance 574" in message
+        assert "new balance 990" in message
 
     def test_format_alert_message_price_drop(self, mock_alert, mock_product):
         """Test message formatting for price drop alert."""
@@ -340,14 +396,16 @@ class TestNotificationService:
     @pytest.mark.asyncio
     async def test_process_unnotified_alerts_disabled(self):
         """Test processing when notifier is disabled."""
-        service = NotificationService(telegram_notifier=None)
-        
-        session = MagicMock()
-        result = await service.process_unnotified_alerts(session)
-        
-        assert result["sent_count"] == 0
-        assert result["failed_count"] == 0
-        assert "reason" in result
+        with patch("app.notifier.telegram.TelegramNotifier") as MockNotifier:
+            MockNotifier.side_effect = ValueError("Config missing")
+            service = NotificationService(telegram_notifier=None)
+            
+            session = MagicMock()
+            result = await service.process_unnotified_alerts(session)
+            
+            assert result["sent_count"] == 0
+            assert result["failed_count"] == 0
+            assert "reason" in result
 
     @pytest.mark.asyncio
     async def test_process_unnotified_alerts_error(self):

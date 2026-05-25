@@ -202,3 +202,29 @@ class Watchlist(Base):
     is_active = Column(Boolean, default=True, index=True)
 
     __table_args__ = (Index("idx_watchlist_active", "is_active"),)
+
+
+class WishlistEntry(Base):
+    """Wishlist entry created from a product URL and metadata."""
+
+    __tablename__ = "wishlist_entries"
+
+    id = Column(Integer, primary_key=True)
+    source_url = Column(String(500), nullable=False, unique=True, index=True)
+    platform = Column(String(50), nullable=False, index=True)
+    brand = Column(String(100), nullable=False, index=True)
+    model_name = Column(String(200), nullable=False, index=True)
+    normalized_name = Column(String(200), nullable=False, index=True)
+    title = Column(String(255), nullable=False)
+    size_scope = Column(Text, nullable=False)
+    platforms_to_track = Column(Text, nullable=False)
+    notes = Column(Text, nullable=True)
+
+    is_active = Column(Boolean, default=True, index=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_wishlist_active_updated", "is_active", "updated_at"),
+        Index("idx_wishlist_normalized_name", "normalized_name"),
+    )

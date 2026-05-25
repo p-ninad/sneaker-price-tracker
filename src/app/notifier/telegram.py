@@ -41,6 +41,41 @@ class TelegramNotifier:
 
         self.bot = Bot(token=self.bot_token)
 
+    async def send_message(self, text: str, context: dict | None = None) -> bool:
+        """Send a raw Telegram message."""
+        try:
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=text,
+                parse_mode="HTML",
+            )
+
+            logger.info(
+                "telegram_message_sent",
+                chat_id=self.chat_id,
+                context=context,
+            )
+            return True
+
+        except TelegramError as e:
+            logger.error(
+                "telegram_send_failed",
+                chat_id=self.chat_id,
+                error=str(e),
+                error_type=type(e).__name__,
+                context=context,
+            )
+            return False
+        except Exception as e:
+            logger.error(
+                "telegram_unexpected_error",
+                chat_id=self.chat_id,
+                error=str(e),
+                error_type=type(e).__name__,
+                context=context,
+            )
+            return False
+
     async def send_alert(self, alert: Alert) -> bool:
         """Send alert via Telegram.
 
@@ -50,16 +85,19 @@ class TelegramNotifier:
         Returns:
             True if sent successfully, False otherwise
         """
-        try:
-            product = alert.product
-            message = self._format_alert_message(alert, product)
+        product = alert.product
+        message = self._format_alert_message(alert, product)
+        sent = await self.send_message(
+            message,
+            context={
+                "kind": "alert",
+                "alert_id": alert.id,
+                "alert_type": alert.alert_type,
+                "product_id": product.id,
+            },
+        )
 
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=message,
-                parse_mode="HTML",
-            )
-
+        if sent:
             logger.info(
                 "telegram_alert_sent",
                 alert_id=alert.id,
@@ -67,24 +105,8 @@ class TelegramNotifier:
                 alert_type=alert.alert_type,
                 chat_id=self.chat_id,
             )
-            return True
 
-        except TelegramError as e:
-            logger.error(
-                "telegram_send_failed",
-                alert_id=alert.id,
-                error=str(e),
-                error_type=type(e).__name__,
-            )
-            return False
-        except Exception as e:
-            logger.error(
-                "telegram_unexpected_error",
-                alert_id=alert.id,
-                error=str(e),
-                error_type=type(e).__name__,
-            )
-            return False
+        return sent
 
     async def send_alerts_batch(self, alerts: list[Alert]) -> dict:
         """Send multiple alerts.
@@ -111,6 +133,55 @@ class TelegramNotifier:
         )
 
         return {"sent_count": sent, "failed_count": failed}
+
+    async def send_scan_summary(
+        self,
+        scan_type: str,
+        entries_scanned: int,
+        products_updated: int,
+        alerts_created: int,
+        mismatches: list[str] | None = None,
+        errors: list[str] | None = None,
+    ) -> bool:
+        """Send a summary message for a scheduled scan run."""
+        message = self._format_scan_summary_message(
+            scan_type,
+            entries_scanned,
+            products_updated,
+            alerts_created,
+            mismatches or [],
+            errors or [],
+        )
+
+        return await self.send_message(
+            message,
+            context={
+                "kind": "scan_summary",
+                "scan_type": scan_type,
+                "entries_scanned": entries_scanned,
+                "products_updated": products_updated,
+                "alerts_created": alerts_created,
+            },
+        )
+
+    async def send_mismatch_alert(
+        self,
+        source_url: str,
+        title: str,
+        expected: str,
+        actual: str,
+    ) -> bool:
+        """Send an operational notification when a fetched product mismatches the wishlist expectation."""
+        message = self._format_mismatch_alert_message(source_url, title, expected, actual)
+
+        return await self.send_message(
+            message,
+            context={
+                "kind": "mismatch_alert",
+                "source_url": source_url,
+                "title": title,
+            },
+        )
 
     def _format_alert_message(self, alert: Alert, product: Product) -> str:
         """Format alert message with product details.
@@ -145,6 +216,49 @@ Type: <code>{alert.alert_type}</code>
         base_message += f"\n\n🔗 <a href=\"{product.product_url}\">View on {product.platform.display_name}</a>"
 
         return base_message
+
+    @staticmethod
+    def _format_scan_summary_message(
+        scan_type: str,
+        entries_scanned: int,
+        products_updated: int,
+        alerts_created: int,
+        mismatches: list[str],
+        errors: list[str],
+    ) -> str:
+        """Format a Telegram summary for scheduled scans."""
+        lines = [
+            f"<b>{scan_type.title()} scan summary</b>",
+            f"Entries scanned: {entries_scanned}",
+            f"Products updated: {products_updated}",
+            f"Alerts created: {alerts_created}",
+        ]
+
+        if mismatches:
+            lines.append("\n⚠️ Mismatches:")
+            lines.extend(f"• {message}" for message in mismatches)
+
+        if errors:
+            lines.append("\n❗ Errors:")
+            lines.extend(f"• {message}" for message in errors)
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_mismatch_alert_message(
+        source_url: str,
+        title: str,
+        expected: str,
+        actual: str,
+    ) -> str:
+        """Format a mismatch alert for the Telegram channel."""
+        return (
+            "<b>Mismatch Alert</b>\n"
+            f"Source: <code>{source_url}</code>\n"
+            f"Wishlist title: {title}\n"
+            f"Expected: {expected}\n"
+            f"Actual: {actual}"
+        )
 
     def send_alert_sync(self, alert: Alert) -> bool:
         """Synchronous wrapper for sending alert.
@@ -236,3 +350,45 @@ class NotificationService:
                 error_type=type(e).__name__,
             )
             return {"sent_count": 0, "failed_count": 0, "error": str(e)}
+
+    async def send_scan_summary(
+        self,
+        scan_type: str,
+        entries_scanned: int,
+        products_updated: int,
+        alerts_created: int,
+        mismatches: list[str] | None = None,
+        errors: list[str] | None = None,
+    ) -> bool:
+        """Send a scan summary message via Telegram when available."""
+        if not self.notifier:
+            logger.warning("notification_service_disabled")
+            return False
+
+        return await self.notifier.send_scan_summary(
+            scan_type=scan_type,
+            entries_scanned=entries_scanned,
+            products_updated=products_updated,
+            alerts_created=alerts_created,
+            mismatches=mismatches,
+            errors=errors,
+        )
+
+    async def send_mismatch_alert(
+        self,
+        source_url: str,
+        title: str,
+        expected: str,
+        actual: str,
+    ) -> bool:
+        """Send a mismatch alert via Telegram when available."""
+        if not self.notifier:
+            logger.warning("notification_service_disabled")
+            return False
+
+        return await self.notifier.send_mismatch_alert(
+            source_url=source_url,
+            title=title,
+            expected=expected,
+            actual=actual,
+        )

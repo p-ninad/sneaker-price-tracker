@@ -2,13 +2,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+ENV PYTHONPATH=/app/src
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     git \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Playwright dependencies
-RUN apt-get update && apt-get install -y \
     libgtk-3-0 \
     libx11-6 \
     libxss1 \
@@ -29,16 +29,18 @@ RUN playwright install
 
 # Copy application code
 COPY src/ /app/src/
-COPY .env .env
 
-ENV PYTHONPATH=/app/src
+# Create runtime directories and non-root user
+RUN groupadd --system appuser && \
+    useradd --system --gid appuser --home /app --shell /usr/sbin/nologin appuser && \
+    mkdir -p /app/data /app/logs && \
+    chown -R appuser:appuser /app
 
-# Create data directory
-RUN mkdir -p /app/data
+USER appuser
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import sqlite3; sqlite3.connect('/app/data/price_tracker.db')"
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "import sqlite3; conn = sqlite3.connect('/app/data/price_tracker.db'); conn.execute('SELECT 1'); conn.close()"
 
 # Run application
 CMD ["python", "-m", "app.main"]

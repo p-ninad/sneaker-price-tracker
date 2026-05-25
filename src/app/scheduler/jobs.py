@@ -1,14 +1,27 @@
 """APScheduler-based job scheduling for scans."""
 
 import asyncio
+import json
+import re
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime
 from app.config import settings
 from app.utils.logger import get_logger
 from app.database.db import get_session
-from app.database.repository import PlatformRepository, ScanJobRepository
+from app.database.models import Product
+from app.database.repository import (
+    PlatformRepository,
+    PriceSnapshotRepository,
+    ProductRepository,
+    ScanJobRepository,
+    StockSnapshotRepository,
+)
 from app.collectors.base import CollectorRegistry
+from app.notifier.telegram import NotificationService
+from app.services.tracking import TrackingService
+from app.services.wishlist import WishlistService
+from app.utils.url_parser import extract_product_id_from_url
 
 logger = get_logger(__name__)
 
@@ -24,6 +37,7 @@ class ScanScheduler:
         """
         self.registry = collector_registry
         self.scheduler = BackgroundScheduler()
+        self.notification_service = NotificationService()
 
     def start(self) -> None:
         """Start the scheduler."""
@@ -113,14 +127,367 @@ class ScanScheduler:
         """Execute watchlist scan."""
         asyncio.run(self._async_watchlist_scan())
 
+    @staticmethod
+    def _parse_sizes(sizes_available) -> list[str]:
+        """Normalize size values into a list of strings."""
+        if sizes_available is None:
+            return []
+
+        if isinstance(sizes_available, list):
+            return [str(size).strip() for size in sizes_available if str(size).strip()]
+
+        if isinstance(sizes_available, str):
+            try:
+                parsed = json.loads(sizes_available)
+            except (TypeError, json.JSONDecodeError):
+                return []
+
+            if isinstance(parsed, list):
+                return [str(size).strip() for size in parsed if str(size).strip()]
+
+        return []
+
+    @staticmethod
+    def _normalize_text(value) -> str:
+        """Normalize free-text identifiers for comparison."""
+        return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+    @staticmethod
+    def _size_scope_matches(size_scope: list[str], sizes_available) -> bool:
+        """Check whether any available size is inside the configured scope."""
+        if not size_scope:
+            return True
+
+        available_sizes = set(ScanScheduler._parse_sizes(sizes_available))
+        if not available_sizes:
+            return False
+
+        return bool(available_sizes.intersection(set(size_scope)))
+
+    @staticmethod
+    def _product_matches_wishlist(entry, product_data) -> bool:
+        """Check whether fetched product metadata matches the wishlist entry."""
+        expected = WishlistService._normalize_name(f"{entry.brand} {entry.model_name}")
+        actual = ScanScheduler._normalize_text(f"{product_data.brand} {product_data.model_name}")
+        return expected == actual
+
+    def _ensure_platform(self, session, collector) -> Product:
+        """Get or create platform record for a collector."""
+        platform = PlatformRepository.get_by_name(session, collector.platform_name)
+        if platform:
+            return platform
+
+        return PlatformRepository.create(
+            session,
+            name=collector.platform_name,
+            display_name=collector.platform_name.title(),
+            base_url=collector.base_url,
+        )
+
+    async def _process_wishlist_product(
+        self,
+        session,
+        entry,
+        collector,
+        product_data,
+    ) -> dict:
+        """Fetch, update, snapshot, and alert on one wishlist product."""
+        size_scope = WishlistService.get_size_scope(entry)
+        if not self._size_scope_matches(size_scope, product_data.sizes_available):
+            logger.info(
+                "Wishlist product skipped due to size scope",
+                platform=collector.platform_name,
+                source_url=entry.source_url,
+                size_scope=size_scope,
+            )
+            return {"success": False, "reason": "size_scope_mismatch", "alerts_created": 0}
+
+        platform = self._ensure_platform(session, collector)
+        source_product_id = product_data.platform_product_id or extract_product_id_from_url(
+            product_data.product_url or entry.source_url
+        )
+
+        if not source_product_id:
+            logger.warning(
+                "Skipping wishlist product without platform product id",
+                platform=collector.platform_name,
+                source_url=entry.source_url,
+            )
+            return {"success": False, "reason": "missing_product_id", "alerts_created": 0}
+
+        existing = session.query(Product).filter(
+            Product.platform_id == platform.id,
+            Product.platform_product_id == source_product_id,
+        ).first()
+
+        baseline = Product(
+            id=existing.id if existing else 0,
+            discounted_price=existing.discounted_price if existing else None,
+            in_stock=existing.in_stock if existing else False,
+            sizes_available=existing.sizes_available if existing else None,
+        )
+
+        updated_product = ProductRepository.create_or_update(
+            session,
+            platform_id=platform.id,
+            product_url=product_data.product_url or entry.source_url,
+            platform_product_id=source_product_id,
+            brand=product_data.brand,
+            model_name=product_data.model_name,
+            title=product_data.title,
+            listed_price=product_data.listed_price,
+            discounted_price=product_data.discounted_price,
+            currency=product_data.currency,
+            in_stock=product_data.in_stock,
+            sizes_available=(
+                json.dumps(product_data.sizes_available)
+                if product_data.sizes_available is not None
+                else None
+            ),
+            image_url=product_data.image_url,
+            sku=product_data.sku,
+        )
+
+        analysis = TrackingService().analyze_product_update(
+            session,
+            baseline,
+            new_listed_price=product_data.listed_price,
+            new_discounted_price=product_data.discounted_price,
+            new_discount_percentage=product_data.discount_percentage,
+            new_in_stock=product_data.in_stock,
+            new_sizes_available=(
+                json.dumps(product_data.sizes_available)
+                if product_data.sizes_available is not None
+                else None
+            ),
+        )
+
+        PriceSnapshotRepository.create(
+            session,
+            updated_product.id,
+            updated_product.listed_price,
+            updated_product.discounted_price,
+            updated_product.discount_percentage,
+            updated_product.currency,
+        )
+        StockSnapshotRepository.create(
+            session,
+            updated_product.id,
+            updated_product.in_stock,
+            json.dumps(product_data.sizes_available)
+            if product_data.sizes_available is not None
+            else None,
+        )
+
+        alerts_created = 0
+        if analysis.has_changes():
+            alerts = TrackingService().create_alerts_from_analysis(session, analysis)
+            alerts_created = len(alerts)
+            logger.info(
+                "Wishlist product analysis completed",
+                source_url=entry.source_url,
+                platform=collector.platform_name,
+                alerts_created=alerts_created,
+            )
+        else:
+            logger.info(
+                "Wishlist product unchanged",
+                source_url=entry.source_url,
+                platform=collector.platform_name,
+            )
+
+        return {"success": True, "alerts_created": alerts_created}
+
     async def _async_watchlist_scan(self) -> None:
         """Async watchlist scan implementation."""
         logger.info("Starting watchlist scan")
         session = get_session()
 
+        entries_scanned = 0
+        products_updated = 0
+        alerts_created = 0
+        size_skipped = 0
+        mismatches = []
+        errors = []
+
         try:
-            # TODO: Implement watchlist-specific scan
-            logger.info("Watchlist scan not yet implemented")
+            active_entries = WishlistService.get_active(session)
+            if not active_entries:
+                logger.info("No active wishlist entries found")
+                if self.notification_service.notifier:
+                    await self.notification_service.send_scan_summary(
+                        scan_type="watchlist",
+                        entries_scanned=0,
+                        products_updated=0,
+                        alerts_created=0,
+                        mismatches=[],
+                        errors=["No active wishlist entries found"],
+                    )
+                return
+
+            scanned_keys = set()
+
+            for entry in active_entries:
+                entries_scanned += 1
+                try:
+                    platforms_to_track = WishlistService.get_platforms_to_track(entry)
+                    source_product_id = extract_product_id_from_url(entry.source_url)
+
+                    if entry.platform in platforms_to_track and source_product_id:
+                        collector = self.registry.get(entry.platform)
+                        if collector is None:
+                            errors.append(
+                                f"{entry.title} on {entry.platform}: no collector registered"
+                            )
+                        else:
+                            product_data = await collector.fetch_product_details(source_product_id)
+                            if not product_data:
+                                errors.append(
+                                    f"{entry.title} on {entry.platform}: source product not found"
+                                )
+                            else:
+                                if not self._product_matches_wishlist(entry, product_data):
+                                    mismatch_message = (
+                                        f"{entry.title}: expected {entry.brand} {entry.model_name}, "
+                                        f"got {product_data.brand} {product_data.model_name}"
+                                    )
+                                    mismatches.append(mismatch_message)
+                                    await self.notification_service.send_mismatch_alert(
+                                        source_url=entry.source_url,
+                                        title=entry.title,
+                                        expected=ScanScheduler._normalize_text(
+                                            f"{entry.brand} {entry.model_name}"
+                                        ),
+                                        actual=ScanScheduler._normalize_text(
+                                            f"{product_data.brand} {product_data.model_name}"
+                                        ),
+                                    )
+
+                                result = await self._process_wishlist_product(
+                                    session,
+                                    entry,
+                                    collector,
+                                    product_data,
+                                )
+                                if result["success"]:
+                                    products_updated += 1
+                                    alerts_created += result["alerts_created"]
+                                elif result["reason"] == "size_scope_mismatch":
+                                    size_skipped += 1
+                                else:
+                                    errors.append(
+                                        f"{entry.title} on {entry.platform}: {result['reason']}"
+                                    )
+                                scanned_keys.add(
+                                    (collector.platform_name, product_data.platform_product_id or source_product_id)
+                                )
+
+                    exact_matches = WishlistService.find_exact_matches(session, entry)
+                    for product in exact_matches:
+                        if product.platform.name not in platforms_to_track:
+                            continue
+
+                        key = (product.platform.name, product.platform_product_id)
+                        if key in scanned_keys:
+                            continue
+
+                        collector = self.registry.get(product.platform.name)
+                        if collector is None:
+                            errors.append(
+                                f"{entry.title} on {product.platform.name}: no collector registered"
+                            )
+                            continue
+
+                        product_id = product.platform_product_id or extract_product_id_from_url(
+                            product.product_url
+                        )
+                        if not product_id:
+                            errors.append(
+                                f"{entry.title} on {product.platform.name}: missing product id"
+                            )
+                            continue
+
+                        product_data = await collector.fetch_product_details(product_id)
+                        if not product_data:
+                            errors.append(
+                                f"{entry.title} on {product.platform.name}: exact match product not found"
+                            )
+                            continue
+
+                        if not self._product_matches_wishlist(entry, product_data):
+                            mismatch_message = (
+                                f"{entry.title}: expected {entry.brand} {entry.model_name}, "
+                                f"got {product_data.brand} {product_data.model_name}"
+                            )
+                            mismatches.append(mismatch_message)
+                            await self.notification_service.send_mismatch_alert(
+                                source_url=product.product_url,
+                                title=entry.title,
+                                expected=ScanScheduler._normalize_text(
+                                    f"{entry.brand} {entry.model_name}"
+                                ),
+                                actual=ScanScheduler._normalize_text(
+                                    f"{product_data.brand} {product_data.model_name}"
+                                ),
+                            )
+
+                        result = await self._process_wishlist_product(
+                            session,
+                            entry,
+                            collector,
+                            product_data,
+                        )
+                        if result["success"]:
+                            products_updated += 1
+                            alerts_created += result["alerts_created"]
+                        elif result["reason"] == "size_scope_mismatch":
+                            size_skipped += 1
+                        else:
+                            errors.append(
+                                f"{entry.title} on {product.platform.name}: {result['reason']}"
+                            )
+                        scanned_keys.add((collector.platform_name, product_data.platform_product_id or product_id))
+
+                except Exception as exc:
+                    logger.error(
+                        "Wishlist scan entry failed",
+                        source_url=entry.source_url,
+                        error=str(exc),
+                    )
+                    errors.append(f"{entry.title}: {str(exc)}")
+
+            logger.info(
+                "Watchlist scan completed",
+                entries=len(active_entries),
+                products_updated=products_updated,
+                alerts_created=alerts_created,
+                size_skipped=size_skipped,
+            )
+            if self.notification_service.notifier:
+                await self.notification_service.send_scan_summary(
+                    scan_type="watchlist",
+                    entries_scanned=entries_scanned,
+                    products_updated=products_updated,
+                    alerts_created=alerts_created,
+                    mismatches=list(dict.fromkeys(mismatches)),
+                    errors=list(dict.fromkeys(errors)),
+                )
+
+            try:
+                dispatch_result = await self.notification_service.process_unnotified_alerts(
+                    session,
+                    batch_size=50,
+                )
+                logger.info(
+                    "Processed unnotified alerts after watchlist scan",
+                    sent_count=dispatch_result.get("sent_count", 0),
+                    failed_count=dispatch_result.get("failed_count", 0),
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to dispatch unnotified alerts after watchlist scan",
+                    error=str(exc),
+                )
         finally:
             session.close()
 

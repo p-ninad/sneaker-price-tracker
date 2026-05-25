@@ -1,8 +1,8 @@
 """Main application entry point."""
 
-import asyncio
 import signal
 import sys
+import time
 from app.config import settings
 from app.utils.logger import setup_logging, get_logger
 from app.database.db import init_db
@@ -46,12 +46,22 @@ def main():
     """Main application entry point."""
     global logger
 
+    # Ensure logging is available immediately so exception handling can log failures
     try:
+        setup_logging()
+        if logger is None:
+            logger = get_logger(__name__)
+    except Exception:
+        # If logging setup itself fails, fallback to printing to stderr
+        print("Failed to initialize logging", file=sys.stderr)
+
+    try:
+        # Initialize app (may reconfigure logging and set the module logger)
+        collector_registry, scheduler = initialize_app()
+
         logger.info("=" * 60)
         logger.info("Price Tracker Starting")
         logger.info("=" * 60)
-
-        collector_registry, scheduler = initialize_app()
 
         # Start scheduler
         scheduler.start()
@@ -69,7 +79,7 @@ def main():
 
         # Keep application running
         while True:
-            asyncio.sleep(1)
+            time.sleep(1)
 
     except Exception as e:
         logger.error("Fatal error during startup", error=str(e))

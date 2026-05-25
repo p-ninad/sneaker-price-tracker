@@ -1,4 +1,4 @@
-.PHONY: help install run dev test lint format clean docker-build docker-run docker-stop init-db
+.PHONY: help install run dev dashboard test lint format clean docker-build docker-run docker-stop init-db
 
 help:
 	@echo "Price Tracker Makefile"
@@ -30,6 +30,9 @@ run:
 
 dev:
 	export PYTHONPATH=./src && python3 -m app.main
+
+dashboard:
+	export PYTHONPATH=./src && python3 -m app.dashboard
 
 test:
 	export PYTHONPATH=./src && python3 -m pytest src/tests -v --cov=src/app
