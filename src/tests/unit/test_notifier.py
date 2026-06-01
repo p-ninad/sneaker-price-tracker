@@ -1,7 +1,7 @@
 """Unit tests for Telegram notifier."""
 
 import pytest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 from telegram.error import TelegramError
 
@@ -150,7 +150,7 @@ class TestTelegramNotifier:
         )
         
         notifier.bot = AsyncMock()
-        notifier.bot.send_message = AsyncMock()
+        notifier.bot.send_message = AsyncMock(return_value=True)
         
         alerts = [mock_alert, mock_alert, mock_alert]
         result = await notifier.send_alerts_batch(alerts)
@@ -170,7 +170,7 @@ class TestTelegramNotifier:
         notifier.bot = AsyncMock()
         # Fail on second call
         notifier.bot.send_message = AsyncMock(
-            side_effect=[None, TelegramError("Error"), None]
+            side_effect=[True, TelegramError("Error"), True]
         )
 
         alerts = [mock_alert, mock_alert, mock_alert]
@@ -237,6 +237,13 @@ class TestTelegramNotifier:
 
     def test_format_alert_message_price_drop(self, mock_alert, mock_product):
         """Test message formatting for price drop alert."""
+        mock_product.last_price_check_at = datetime.utcnow() - timedelta(minutes=15)
+        previous_snapshot = MagicMock()
+        previous_snapshot.recorded_at = datetime.utcnow() - timedelta(hours=2)
+        previous_snapshot.discounted_price = 9200.0
+        previous_snapshot.listed_price = 12000.0
+        mock_product.price_history = [previous_snapshot]
+
         notifier = TelegramNotifier(
             bot_token="test_token",
             chat_id="test_chat"
@@ -251,6 +258,31 @@ class TestTelegramNotifier:
         assert "25%" in message
         assert "✅ In Stock" in message
         assert "https://myntra.com/shoes/123" in message
+        assert "⌛ Last scanned:" in message
+        assert "View on Myntra" in message
+
+    def test_format_alert_message_with_previous_scan(self, mock_alert, mock_product):
+        """Test message includes previous scanned price when available."""
+        mock_product.last_price_check_at = datetime.utcnow() - timedelta(minutes=30)
+        current_snapshot = MagicMock()
+        current_snapshot.recorded_at = datetime.utcnow() - timedelta(minutes=30)
+        current_snapshot.discounted_price = 8999.0
+        current_snapshot.listed_price = 12000.0
+        previous_snapshot = MagicMock()
+        previous_snapshot.recorded_at = datetime.utcnow() - timedelta(hours=2)
+        previous_snapshot.discounted_price = 9500.0
+        previous_snapshot.listed_price = 12000.0
+        mock_product.price_history = [current_snapshot, previous_snapshot]
+
+        notifier = TelegramNotifier(
+            bot_token="test_token",
+            chat_id="test_chat"
+        )
+
+        message = notifier._format_alert_message(mock_alert, mock_product)
+
+        assert "📉 Last scanned price:" in message
+        assert "₹9,500" in message
 
     def test_format_alert_message_out_of_stock(self, mock_alert, mock_product):
         """Test message formatting for out of stock alert."""

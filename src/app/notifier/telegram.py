@@ -1,6 +1,8 @@
 """Telegram notifier for sending price alerts to users."""
 
 import asyncio
+import html
+from datetime import datetime
 from typing import Optional
 from telegram import Bot
 from telegram.error import TelegramError
@@ -106,7 +108,7 @@ class TelegramNotifier:
                 chat_id=self.chat_id,
             )
 
-        return sent
+        return bool(sent)
 
     async def send_alerts_batch(self, alerts: list[Alert]) -> dict:
         """Send multiple alerts.
@@ -193,18 +195,34 @@ class TelegramNotifier:
         Returns:
             Formatted HTML message for Telegram
         """
-        base_message = f"""<b>{product.brand} {product.model_name}</b>
-Platform: <i>{product.platform.display_name}</i>
-Type: <code>{alert.alert_type}</code>
+        brand = html.escape(product.brand or "")
+        model_name = html.escape(product.model_name or "")
+        platform_name = html.escape(product.platform.display_name if product.platform else "")
+        alert_type = html.escape(alert.alert_type or "")
+        message_body = html.escape(alert.message or "").replace("\n", "\n")
 
-{alert.message}"""
+        base_message = f"""<b>{brand} {model_name}</b>
+Platform: <i>{platform_name}</i>
+Type: <code>{alert_type}</code>
+
+{message_body}"""
 
         # Add price info if available
-        if product.discounted_price:
-            price_line = f"\n💰 Current Price: <b>₹{product.discounted_price:,.0f}</b>"
+        if product.discounted_price or product.listed_price:
+            current_price = product.discounted_price or product.listed_price
+            price_line = f"\n💰 Current Price: <b>₹{current_price:,.0f}</b>"
             if product.discount_percentage:
                 price_line += f" ({product.discount_percentage:.0f}% off)"
             base_message += price_line
+
+            previous_price_line = self._format_previous_price_line(product)
+            if previous_price_line:
+                base_message += f"\n{previous_price_line}"
+
+        # Add scan timestamp and age
+        scan_age_line = self._format_last_scanned_ago(product.last_price_check_at)
+        if scan_age_line:
+            base_message += f"\n⌛ Last scanned: <b>{scan_age_line}</b>"
 
         # Add stock info
         if product.in_stock:
@@ -213,9 +231,57 @@ Type: <code>{alert.alert_type}</code>
             base_message += "\n❌ Out of Stock"
 
         # Add link to product
-        base_message += f"\n\n🔗 <a href=\"{product.product_url}\">View on {product.platform.display_name}</a>"
+        product_url = html.escape(product.product_url or "")
+        platform_name = html.escape(product.platform.display_name if product.platform else "")
+        base_message += f"\n\n🔗 <a href=\"{product_url}\">View on {platform_name}</a>"
 
         return base_message
+
+    def _format_previous_price_line(self, product: Product) -> str | None:
+        """Format previous scanned price line for a product."""
+        price_history = getattr(product, "price_history", None)
+        if not isinstance(price_history, list):
+            return None
+
+        snapshots = [
+            snapshot
+            for snapshot in price_history
+            if getattr(snapshot, "recorded_at", None) is not None
+        ]
+        if len(snapshots) < 2:
+            return None
+
+        snapshots.sort(key=lambda snapshot: snapshot.recorded_at, reverse=True)
+        previous = snapshots[1]
+        previous_price = previous.discounted_price or previous.listed_price
+        if previous_price is None:
+            return None
+
+        return f"📉 Last scanned price: <b>₹{previous_price:,.0f}</b>"
+
+    @staticmethod
+    def _format_last_scanned_ago(last_scanned_at: datetime | None) -> str | None:
+        """Return a human-readable relative duration since the last scan."""
+        if not last_scanned_at or not isinstance(last_scanned_at, datetime):
+            return None
+
+        now = datetime.utcnow()
+        delta = now - last_scanned_at
+        if delta.total_seconds() < 0:
+            return "just now"
+
+        minutes = int(delta.total_seconds() / 60)
+        if minutes < 1:
+            return "just now"
+        if minutes < 60:
+            return f"{minutes}m ago"
+
+        hours = int(minutes / 60)
+        if hours < 24:
+            return f"{hours}h ago"
+
+        days = int(hours / 24)
+        return f"{days}d ago"
 
     @staticmethod
     def _format_scan_summary_message(
