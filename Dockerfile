@@ -9,13 +9,9 @@ ENV PIP_NO_CACHE_DIR=1
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     git \
-    libgtk-3-0 \
     libx11-6 \
     libxss1 \
-    libappindicator1 \
-    libindicator7 \
     libnss3 \
-    libc++1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements

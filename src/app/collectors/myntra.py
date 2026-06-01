@@ -212,19 +212,203 @@ class MyntraCollector(BaseCollector):
                 data = response.json()
                 return self._parse_api_product(data)
 
+        except httpx.HTTPStatusError as e:
+            logger.debug(
+                "API fetch returned error status",
+                product_id=product_id,
+                status_code=e.response.status_code,
+            )
+            return None
         except Exception as e:
-            logger.debug(f"API fetch failed: {e}", product_id=product_id)
+            logger.debug(
+                "API fetch failed, will try scraping",
+                product_id=product_id,
+                error=str(e),
+            )
             return None
 
     async def _fetch_details_via_scraping(self, product_id: str) -> Optional[ProductData]:
         """Fallback: Fetch product details using Playwright."""
         try:
-            # TODO: Implement Playwright-based scraping
-            logger.info("HTML scraping not yet implemented for Myntra", platform="myntra")
-            return None
+            from playwright.async_api import async_playwright
+            from bs4 import BeautifulSoup
+
+            await self.random_delay()
+
+            # Build URL - try common Myntra URL patterns
+            possible_urls = [
+                f"https://www.myntra.com/p/{product_id}",
+                f"https://www.myntra.com/products/{product_id}",
+                f"https://www.myntra.com/shoes/{product_id}",
+            ]
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=settings.playwright_headless
+                )
+                page = await browser.new_page()
+
+                product_data = None
+                last_error = None
+
+                for url in possible_urls:
+                    try:
+                        logger.debug(
+                            "Scraping Myntra product",
+                            product_id=product_id,
+                            url=url,
+                        )
+
+                        await page.goto(
+                            url,
+                            timeout=settings.browser_timeout_ms,
+                            wait_until="networkidle",
+                        )
+
+                        # Wait for product info to load
+                        try:
+                            await page.wait_for_selector(
+                                "h1, .productTitle, [class*='title']",
+                                timeout=5000,
+                            )
+                        except Exception:
+                            pass  # Page might have loaded without waiting
+
+                        html = await page.content()
+                        product_data = self._parse_html_product(html, url)
+
+                        if product_data:
+                            logger.info(
+                                "Successfully scraped product",
+                                product_id=product_id,
+                                url=url,
+                            )
+                            break  # Found it, exit loop
+
+                    except Exception as e:
+                        last_error = e
+                        logger.debug(
+                            "URL attempt failed",
+                            product_id=product_id,
+                            url=url,
+                            error=str(e),
+                        )
+                        continue
+
+                await browser.close()
+
+                if not product_data and last_error:
+                    logger.warning(
+                        "Playwright scraping exhausted all URLs",
+                        product_id=product_id,
+                        error=str(last_error),
+                    )
+
+                return product_data
 
         except Exception as e:
-            logger.debug(f"HTML scraping failed: {e}", product_id=product_id)
+            logger.debug(
+                "Playwright scraping failed",
+                product_id=product_id,
+                error=str(e),
+            )
+            return None
+
+    def _parse_html_product(self, html: str, url: str) -> Optional[ProductData]:
+        """Parse product data from HTML using BeautifulSoup."""
+        try:
+            from bs4 import BeautifulSoup
+
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Try various selectors for product title
+            title = None
+            for selector in [
+                "h1",
+                ".productTitle",
+                "[class*='title']",
+                "meta[property='og:title']",
+            ]:
+                element = soup.select_one(selector)
+                if element:
+                    if element.name == "meta":
+                        title = element.get("content", "").strip()
+                    else:
+                        title = element.get_text(strip=True)
+                    if title:
+                        break
+
+            if not title:
+                logger.debug("Could not extract title from HTML", url=url)
+                return None
+
+            # Extract price information
+            listed_price = None
+            discounted_price = None
+
+            # Try to find price elements
+            price_selectors = {
+                "discounted_price": [
+                    ".productPrice",
+                    "[class*='price']",
+                    ".discountedPrice",
+                ],
+                "listed_price": [".mrp", ".originalPrice", ".listPrice"],
+            }
+
+            for price_type, selectors in price_selectors.items():
+                for selector in selectors:
+                    elements = soup.select(selector)
+                    for elem in elements:
+                        text = elem.get_text(strip=True)
+                        # Extract numbers
+                        import re
+
+                        numbers = re.findall(r"\d+\.?\d*", text)
+                        if numbers:
+                            price_val = float(numbers[0])
+                            if price_type == "discounted_price":
+                                discounted_price = price_val
+                            else:
+                                listed_price = price_val
+                            break
+                    if price_type == "discounted_price" and discounted_price:
+                        break
+                    elif price_type == "listed_price" and listed_price:
+                        break
+
+            # Extract brand and model from title
+            brand, model = self.normalize_product_name(title)
+
+            # Try to extract stock status
+            in_stock = "out of stock" not in html.lower()
+
+            # Try to extract image
+            image_url = None
+            img_element = soup.select_one("img[class*='image'], img[class*='product']")
+            if img_element:
+                image_url = img_element.get("src") or img_element.get("data-src")
+
+            product = ProductData(
+                platform_product_id=url.split("/")[-1],
+                product_url=url,
+                title=title,
+                brand=brand,
+                model_name=model,
+                listed_price=listed_price,
+                discounted_price=discounted_price,
+                currency="INR",
+                in_stock=in_stock,
+                image_url=image_url,
+                description=None,
+                sku=None,
+            )
+
+            logger.debug("Parsed product from HTML", product_id=product.platform_product_id)
+            return product
+
+        except Exception as e:
+            logger.debug(f"Failed to parse HTML product: {e}")
             return None
 
     def _parse_api_product(self, data: dict) -> Optional[ProductData]:

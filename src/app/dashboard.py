@@ -1,8 +1,11 @@
 """Local dashboard for managing wishlist entries."""
 
 import argparse
+import base64
+import binascii
 import html
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
@@ -13,6 +16,39 @@ from app.services.wishlist import WishlistService
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def get_dashboard_credentials() -> tuple[str | None, str | None]:
+    """Read dashboard auth credentials from the environment."""
+    return os.getenv("DASHBOARD_USERNAME"), os.getenv("DASHBOARD_PASSWORD")
+
+
+def parse_basic_auth(header_value: str | None) -> tuple[str, str] | None:
+    """Parse a Basic auth header into (username, password)."""
+    if not header_value or not header_value.startswith("Basic "):
+        return None
+
+    try:
+        decoded = base64.b64decode(header_value.removeprefix("Basic "), validate=True)
+        decoded_text = decoded.decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+
+    username, separator, password = decoded_text.partition(":")
+    if not separator:
+        return None
+
+    return username, password
+
+
+def is_dashboard_authorized(header_value: str | None) -> bool:
+    """Return whether the request is authorized when dashboard auth is enabled."""
+    username, password = get_dashboard_credentials()
+    if not username or not password:
+        return True
+
+    parsed = parse_basic_auth(header_value)
+    return parsed == (username, password)
 
 
 def parse_csv(value: str | None) -> list[str] | None:
@@ -166,18 +202,42 @@ def render_template(summary: dict, flash: str | None = None) -> str:
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "PriceTrackerDashboard/1.0"
 
-    def do_GET(self):
-        if self.path == "/":
-            self._render_page()
-            return
+    def _require_auth(self) -> bool:
+        if is_dashboard_authorized(self.headers.get("Authorization")):
+            return True
 
+        self._send_unauthorized()
+        return False
+
+    def _send_unauthorized(self):
+        body = b"Unauthorized"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Price Tracker Dashboard"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        # Health check endpoint is public (needed for reverse proxy health checks)
         if self.path == "/health":
             self._send_json({"status": "ok"})
+            return
+
+        # All other endpoints require authentication
+        if not self._require_auth():
+            return
+
+        if self.path == "/":
+            self._render_page()
             return
 
         self.send_error(404)
 
     def do_POST(self):
+        if not self._require_auth():
+            return
+
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode()
         data = parse_qs(body, keep_blank_values=True)

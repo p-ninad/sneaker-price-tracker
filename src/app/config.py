@@ -1,23 +1,27 @@
 """Configuration management for the price tracker."""
 
-from pydantic_settings import BaseSettings
-from pydantic import Field
-from typing import Optional
 from pathlib import Path
 import os
+from typing import Optional
+
+from dotenv import dotenv_values
+from pydantic import Field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
+    model_config = SettingsConfigDict(case_sensitive=False, extra="ignore")
+
     # === Core ===
     env: str = Field(default="development", alias="ENV")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
-    
+
     # Database - use absolute path to data directory
     _data_dir = Path(__file__).parent.parent.parent / "data"
     _data_dir.mkdir(exist_ok=True)
-    
+
     database_url: str = Field(
         default=f"sqlite:///{_data_dir / 'price_tracker.db'}", alias="DATABASE_URL"
     )
@@ -76,9 +80,21 @@ class Settings(BaseSettings):
         default=True, alias="RESTOCK_NOTIFICATION_ENABLED"
     )
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    @model_validator(mode="after")
+    def validate_secret_configuration(self):
+        """Fail fast when the runtime configuration is internally inconsistent."""
+        telegram_pair_configured = bool(self.telegram_bot_token) or bool(
+            self.telegram_chat_id
+        )
+
+        if telegram_pair_configured and not (
+            self.telegram_bot_token and self.telegram_chat_id
+        ):
+            raise ValueError(
+                "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must both be set together."
+            )
+
+        return self
 
     @property
     def enabled_platforms_list(self) -> list[str]:
@@ -91,5 +107,40 @@ class Settings(BaseSettings):
         return self.env.lower() == "production"
 
 
-# Global settings instance
-settings = Settings()
+def load_settings(env_file: str | Path | None = None) -> Settings:
+    """Load settings from the environment and an optional env file.
+
+    Use APP_ENV_FILE to override the default .env path. If the file is missing,
+    the application falls back to environment variables only.
+    """
+    env_file_path = (
+        Path(env_file)
+        if env_file is not None
+        else Path(os.getenv("APP_ENV_FILE", ".env"))
+    )
+
+    if not env_file_path.exists():
+        return Settings()
+
+    env_values = dotenv_values(str(env_file_path))
+    original_env = {key: os.environ.get(key) for key in env_values if key in os.environ}
+
+    try:
+        for key, value in env_values.items():
+            if value is not None and key not in os.environ:
+                os.environ[key] = value
+
+        return Settings()
+    finally:
+        for key, original_value in original_env.items():
+            if original_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = original_value
+
+        for key in env_values:
+            if key not in original_env:
+                os.environ.pop(key, None)
+
+
+settings = load_settings()

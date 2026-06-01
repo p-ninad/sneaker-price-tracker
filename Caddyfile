@@ -1,0 +1,32 @@
+# Price Tracker Reverse Proxy
+# By default, this serves on http://localhost:80
+# For HTTPS or custom domains, set the CADDY_DOMAIN environment variable
+
+{$CADDY_DOMAIN:localhost}
+
+# Reverse proxy to the dashboard service (internal only, not exposed directly)
+reverse_proxy dashboard:8000 {
+  # Add security headers
+  header_up X-Forwarded-Proto https
+  header_up X-Forwarded-Host {host}
+  
+  # Health check endpoint
+  health_uri /health
+  health_port 8000
+  health_interval 10s
+  health_timeout 5s
+}
+
+# Add security headers to all responses
+header {
+  # Prevent clickjacking
+  X-Frame-Options "SAMEORIGIN"
+  # Prevent MIME type sniffing
+  X-Content-Type-Options "nosniff"
+  # Enable XSS protection
+  X-XSS-Protection "1; mode=block"
+  # Referrer policy
+  Referrer-Policy "no-referrer-when-downgrade"
+  # Content Security Policy
+  Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'"
+}

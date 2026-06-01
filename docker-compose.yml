@@ -24,6 +24,56 @@ services:
     networks:
       - price-tracker-net
 
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: price-tracker-dashboard
+    command: ["python", "-m", "app.dashboard", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      ENV: production
+      LOG_LEVEL: INFO
+      DATABASE_URL: sqlite:////app/data/price_tracker.db
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-admin}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-changeme}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - price-tracker-net
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: price-tracker-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - dashboard
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - price-tracker-net
+
+volumes:
+  caddy_data:
+  caddy_config:
+
 networks:
   price-tracker-net:
     driver: bridge

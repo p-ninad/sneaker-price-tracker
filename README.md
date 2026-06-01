@@ -48,7 +48,7 @@ cd price_tracker
 # Install dependencies
 make install
 
-# Create .env file
+# Create local secrets file
 cp .env.example .env
 # Edit .env with your API keys
 
@@ -59,13 +59,21 @@ make init
 make run
 ```
 
+### Secrets Management
+
+- Local development uses a personal `.env` file copied from `.env.example`.
+- The repository ignores `.env`, so secrets remain out of Git history.
+- Docker and VPS deployments should inject secrets via environment variables or a mounted secret file.
+- If you want the app to read a non-default file, set `APP_ENV_FILE=/path/to/your/secrets.env` before starting the process.
+- Production startup will fail fast if only one Telegram credential is present (`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` must both be set).
+
 ### Docker Deployment
 
 ```bash
 # Build image
 make docker-build
 
-# Start with docker-compose
+# Start with docker-compose (includes reverse proxy + auth)
 make docker-run
 
 # View logs
@@ -75,37 +83,53 @@ make docker-logs
 make docker-stop
 ```
 
+### Accessing the Dashboard
+
+After starting with `docker-compose`, the dashboard is available at:
+- **Local**: `http://localhost`
+- **Via reverse proxy**: The dashboard is only exposed through the Caddy reverse proxy (port 80/443), not directly
+- **Credentials**: Use the `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` from your `.env` file
+
+#### Authentication
+
+The dashboard is protected with HTTP Basic Authentication by default. When you access it, your browser will prompt you for a username and password.
+
+```bash
+# Using curl with basic auth:
+curl -u operator:changeme-in-production http://localhost/
+```
+
+#### Configuring HTTPS
+
+To enable HTTPS with automatic certificate generation via Caddy:
+
+1. Point your domain to the VPS
+2. Set `CADDY_DOMAIN=your-domain.com` in your `.env`
+3. Restart the services
+
+Caddy will automatically request and manage SSL certificates.
+
 ## Configuration
 
-Edit `.env` file with the following:
+Use `.env.example` as the template for local development and fill in the values you need.
+
+For Docker or a VPS, prefer exporting secrets directly in the runtime environment or mounting them from a secure file. The app will load `.env` automatically when it exists, otherwise it falls back to environment variables only.
+
+Example environment variables:
 
 ```env
-# Core
 ENV=production
 LOG_LEVEL=INFO
-
-# OpenAI (optional)
 OPENAI_API_KEY=sk-...
-OPENAI_MODEL_MAIN=gpt-4o-mini
-
-# Telegram
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 TELEGRAM_CHAT_ID=987654321
-
-# Scraping
 PLAYWRIGHT_HEADLESS=true
 MIN_DELAY_BETWEEN_REQUESTS_SECONDS=3
 MAX_DELAY_BETWEEN_REQUESTS_SECONDS=10
-
-# Scheduler
 CATALOG_SCAN_INTERVAL_HOURS=6
 WATCHLIST_SCAN_INTERVAL_HOURS=1
 HOT_ITEMS_SCAN_INTERVAL_MINUTES=15
-
-# Platforms
 ENABLED_PLATFORMS=myntra,ajio,vegnonveg,superkicks
-
-# Alerts
 PRICE_DROP_THRESHOLD_PERCENT=10
 ```
 
