@@ -8,14 +8,19 @@ from app.database.models import Base
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+_ENGINE: Engine | None = None
+_SESSION_FACTORY: sessionmaker | None = None
 
 
 def get_engine() -> Engine:
     """Create database engine with SQLite optimizations."""
+    global _ENGINE
+    if _ENGINE is not None:
+        return _ENGINE
 
     # SQLite-specific configuration
     if settings.database_url.startswith("sqlite"):
-        engine = create_engine(
+        _ENGINE = create_engine(
             settings.database_url,
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
@@ -23,7 +28,7 @@ def get_engine() -> Engine:
         )
 
         # Enable WAL mode for better concurrency
-        @event.listens_for(Engine, "connect")
+        @event.listens_for(_ENGINE, "connect")
         def set_sqlite_pragma(dbapi_conn, connection_record):
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
@@ -32,13 +37,13 @@ def get_engine() -> Engine:
             cursor.close()
     else:
         # PostgreSQL or other databases
-        engine = create_engine(
+        _ENGINE = create_engine(
             settings.database_url,
             pool_pre_ping=True,
             echo=False,
         )
 
-    return engine
+    return _ENGINE
 
 
 def init_db() -> None:
@@ -50,9 +55,10 @@ def init_db() -> None:
 
 def get_session() -> Session:
     """Get a new database session."""
-    engine = get_engine()
-    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
-    return SessionLocal()
+    global _SESSION_FACTORY
+    if _SESSION_FACTORY is None:
+        _SESSION_FACTORY = sessionmaker(bind=get_engine(), expire_on_commit=False)
+    return _SESSION_FACTORY()
 
 
 def close_session(session: Session) -> None:

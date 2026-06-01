@@ -5,6 +5,7 @@ WORKDIR /app
 ENV PYTHONPATH=/app/src
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -21,7 +22,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Playwright browsers
-RUN playwright install
+RUN playwright install --with-deps chromium && \
+    chmod -R a+rX /ms-playwright
 
 # Copy application code
 COPY src/ /app/src/

@@ -71,6 +71,7 @@ class ScanScheduler:
             name="Catalog Scan",
             replace_existing=True,
             max_instances=1,
+            next_run_time=datetime.utcnow(),
         )
         logger.info(
             f"Registered catalog scan (every {settings.catalog_scan_interval_hours}h)"
@@ -85,6 +86,7 @@ class ScanScheduler:
             name="Watchlist Scan",
             replace_existing=True,
             max_instances=1,
+            next_run_time=datetime.utcnow(),
         )
         logger.info(
             f"Registered watchlist scan (every {settings.watchlist_scan_interval_hours}h)"
@@ -99,6 +101,7 @@ class ScanScheduler:
             name="Hot Items Scan",
             replace_existing=True,
             max_instances=1,
+            next_run_time=datetime.utcnow(),
         )
         logger.info(
             f"Registered hot items scan (every {settings.hot_items_scan_interval_minutes}m)"
@@ -333,22 +336,60 @@ class ScanScheduler:
                     platforms_to_track = WishlistService.get_platforms_to_track(entry)
                     source_product_id = extract_product_id_from_url(entry.source_url)
 
+                    logger.debug(
+                        "Processing wishlist entry",
+                        entry_id=entry.id,
+                        title=entry.title,
+                        platform=entry.platform,
+                        source_url=entry.source_url,
+                        extracted_product_id=source_product_id,
+                        platforms_to_track=platforms_to_track,
+                    )
+
                     if entry.platform in platforms_to_track and source_product_id:
                         collector = self.registry.get(entry.platform)
                         if collector is None:
                             errors.append(
                                 f"{entry.title} on {entry.platform}: no collector registered"
                             )
+                            logger.warning(
+                                "No collector registered",
+                                entry_title=entry.title,
+                                platform=entry.platform,
+                            )
                         else:
-                            product_data = await collector.fetch_product_details(source_product_id)
+                            logger.debug(
+                                "Fetching product details",
+                                title=entry.title,
+                                platform=entry.platform,
+                                product_id=source_product_id,
+                            )
+                            product_data = await collector.fetch_product_details(entry.source_url)
                             if not product_data:
-                                errors.append(
-                                    f"{entry.title} on {entry.platform}: source product not found"
+                                error_msg = (
+                                    f"{entry.title} on {entry.platform} [{entry.source_url}]: "
+                                    "source product not found"
+                                )
+                                errors.append(error_msg)
+                                logger.warning(
+                                    "Failed to fetch product",
+                                    entry_title=entry.title,
+                                    platform=entry.platform,
+                                    product_id=source_product_id,
+                                    source_url=entry.source_url,
                                 )
                             else:
+                                logger.debug(
+                                    "Successfully fetched product",
+                                    title=entry.title,
+                                    product_id=source_product_id,
+                                    brand=product_data.brand,
+                                    model=product_data.model_name,
+                                )
                                 if not self._product_matches_wishlist(entry, product_data):
                                     mismatch_message = (
-                                        f"{entry.title}: expected {entry.brand} {entry.model_name}, "
+                                        f"{entry.title} [{entry.source_url}]: "
+                                        f"expected {entry.brand} {entry.model_name}, "
                                         f"got {product_data.brand} {product_data.model_name}"
                                     )
                                     mismatches.append(mismatch_message)
@@ -407,7 +448,9 @@ class ScanScheduler:
                             )
                             continue
 
-                        product_data = await collector.fetch_product_details(product_id)
+                        product_data = await collector.fetch_product_details(
+                            product.product_url or product_id
+                        )
                         if not product_data:
                             errors.append(
                                 f"{entry.title} on {product.platform.name}: exact match product not found"
@@ -416,7 +459,8 @@ class ScanScheduler:
 
                         if not self._product_matches_wishlist(entry, product_data):
                             mismatch_message = (
-                                f"{entry.title}: expected {entry.brand} {entry.model_name}, "
+                                f"{entry.title} [{product.product_url}]: "
+                                f"expected {entry.brand} {entry.model_name}, "
                                 f"got {product_data.brand} {product_data.model_name}"
                             )
                             mismatches.append(mismatch_message)

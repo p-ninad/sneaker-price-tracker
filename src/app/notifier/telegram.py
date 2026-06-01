@@ -124,8 +124,16 @@ class TelegramNotifier:
             return_exceptions=True,
         )
 
-        sent = sum(1 for r in results if r is True)
-        failed = sum(1 for r in results if r is False or isinstance(r, Exception))
+        sent_alert_ids = []
+        failed_alert_ids = []
+        for alert, result in zip(alerts, results):
+            if result is True:
+                sent_alert_ids.append(alert.id)
+            else:
+                failed_alert_ids.append(alert.id)
+
+        sent = len(sent_alert_ids)
+        failed = len(failed_alert_ids)
 
         logger.info(
             "telegram_batch_send_complete",
@@ -134,7 +142,12 @@ class TelegramNotifier:
             failed=failed,
         )
 
-        return {"sent_count": sent, "failed_count": failed}
+        return {
+            "sent_count": sent,
+            "failed_count": failed,
+            "sent_alert_ids": sent_alert_ids,
+            "failed_alert_ids": failed_alert_ids,
+        }
 
     async def send_scan_summary(
         self,
@@ -233,6 +246,7 @@ Type: <code>{alert_type}</code>
         # Add link to product
         product_url = html.escape(product.product_url or "")
         platform_name = html.escape(product.platform.display_name if product.platform else "")
+        base_message += f"\n🔎 Source URL: <code>{product_url}</code>"
         base_message += f"\n\n🔗 <a href=\"{product_url}\">View on {platform_name}</a>"
 
         return base_message
@@ -320,10 +334,10 @@ Type: <code>{alert_type}</code>
         """Format a mismatch alert for the Telegram channel."""
         return (
             "<b>Mismatch Alert</b>\n"
-            f"Source: <code>{source_url}</code>\n"
-            f"Wishlist title: {title}\n"
-            f"Expected: {expected}\n"
-            f"Actual: {actual}"
+            f"Source: <code>{html.escape(source_url)}</code>\n"
+            f"Wishlist title: {html.escape(title)}\n"
+            f"Expected: {html.escape(expected)}\n"
+            f"Actual: {html.escape(actual)}"
         )
 
     def send_alert_sync(self, alert: Alert) -> bool:
@@ -396,8 +410,14 @@ class NotificationService:
             # Send batch
             result = await self.notifier.send_alerts_batch(unnotified)
 
-            # Mark sent alerts as notified
+            sent_ids = set(result.get("sent_alert_ids", []))
+            if not sent_ids and result.get("failed_count", 0) == 0:
+                sent_ids = {alert.id for alert in unnotified}
+
+            # Mark only successfully sent alerts as notified
             for alert in unnotified:
+                if alert.id not in sent_ids:
+                    continue
                 try:
                     AlertRepository.mark_notified(session, alert)
                 except Exception as e:

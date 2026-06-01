@@ -6,7 +6,7 @@ services:
     container_name: price-tracker
     environment:
       ENV: production
-      LOG_LEVEL: INFO
+      LOG_LEVEL: DEBUG
       DATABASE_URL: sqlite:////app/data/price_tracker.db
       PLAYWRIGHT_HEADLESS: "true"
       ENABLE_SCHEDULER: "true"
