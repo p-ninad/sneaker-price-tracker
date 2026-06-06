@@ -1,4 +1,8 @@
-.PHONY: help install run dev dashboard test lint format clean docker-build docker-run docker-stop init-db
+.DEFAULT_GOAL := help
+
+SERVICE ?= all
+
+.PHONY: help install run dev dashboard ready test lint format clean docker-build docker-run docker-stop init-db db-migrate
 
 help:
 	@echo "Price Tracker Makefile"
@@ -9,6 +13,7 @@ help:
 	@echo "  make init          - Initialize database"
 	@echo "  make run           - Run the application"
 	@echo "  make dev           - Run in development mode with auto-reload"
+	@echo "  make ready         - Run deploy-time readiness checks (SERVICE=all|dashboard|main|telegram-bot)"
 	@echo "  make test          - Run tests"
 	@echo "  make lint          - Run linter (ruff)"
 	@echo "  make format        - Format code (black + ruff)"
@@ -16,6 +21,7 @@ help:
 	@echo "  make docker-build  - Build Docker image"
 	@echo "  make docker-run    - Start Docker container"
 	@echo "  make docker-stop   - Stop Docker container"
+	@echo "  make db-migrate    - Apply database migrations"
 	@echo ""
 
 install:
@@ -33,6 +39,9 @@ dev:
 
 dashboard:
 	export PYTHONPATH=./src && python3 -m app.dashboard
+
+ready:
+	export PYTHONPATH=./src && python3 -m app.readiness --service $(SERVICE)
 
 test:
 	export PYTHONPATH=./src && python3 -m pytest src/tests -v --cov=src/app
@@ -75,7 +84,7 @@ docker-shell:
 
 # Development utilities
 db-migrate:
-	echo "Database migrations not yet implemented"
+	export PYTHONPATH=./src && python3 -m app.migrations upgrade head
 
 db-seed:
 	echo "Database seeding not yet implemented"

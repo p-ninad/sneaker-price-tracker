@@ -156,23 +156,73 @@ class ScanScheduler:
         return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
     @staticmethod
+    def _normalize_size_token(size_value: str) -> str:
+        """Normalize size text across variants like UK12, UK 12, and 12."""
+        token = str(size_value or "").strip().upper()
+        if not token:
+            return ""
+        token = token.replace("UK", "").strip()
+        token = re.sub(r"[^0-9.]", "", token)
+        if not token:
+            return ""
+        try:
+            numeric = float(token)
+            if numeric.is_integer():
+                return str(int(numeric))
+            return f"{numeric:.1f}".rstrip("0").rstrip(".")
+        except ValueError:
+            return token
+
+    @staticmethod
     def _size_scope_matches(size_scope: list[str], sizes_available) -> bool:
         """Check whether any available size is inside the configured scope."""
         if not size_scope:
             return True
 
-        available_sizes = set(ScanScheduler._parse_sizes(sizes_available))
+        available_sizes = {
+            ScanScheduler._normalize_size_token(size)
+            for size in ScanScheduler._parse_sizes(sizes_available)
+            if ScanScheduler._normalize_size_token(size)
+        }
         if not available_sizes:
             return False
 
-        return bool(available_sizes.intersection(set(size_scope)))
+        scope_sizes = {
+            ScanScheduler._normalize_size_token(size)
+            for size in size_scope
+            if ScanScheduler._normalize_size_token(size)
+        }
+        return bool(available_sizes.intersection(scope_sizes))
+
+    @staticmethod
+    def _model_tokens(value: str) -> set[str]:
+        """Extract meaningful comparison tokens from model/title text."""
+        noise = {
+            "buy", "unisex", "men", "mens", "women", "womens",
+            "shoe", "shoes", "sneaker", "sneakers", "footwear",
+            "for", "the", "and", "with", "textured", "everyday",
+            "casual", "lifestyle",
+        }
+        tokens = re.findall(r"[a-z0-9.]+", ScanScheduler._normalize_text(value))
+        return {token for token in tokens if token not in noise and len(token) > 1}
 
     @staticmethod
     def _product_matches_wishlist(entry, product_data) -> bool:
         """Check whether fetched product metadata matches the wishlist entry."""
         expected = WishlistService._normalize_name(f"{entry.brand} {entry.model_name}")
         actual = ScanScheduler._normalize_text(f"{product_data.brand} {product_data.model_name}")
-        return expected == actual
+        if expected == actual:
+            return True
+
+        expected_model_tokens = ScanScheduler._model_tokens(entry.model_name or "")
+        actual_model_tokens = ScanScheduler._model_tokens(
+            f"{product_data.model_name or ''} {product_data.title or ''}"
+        )
+        if not expected_model_tokens:
+            return False
+
+        # Treat this as a match when all meaningful wishlist tokens are present in fetched text.
+        return expected_model_tokens.issubset(actual_model_tokens)
 
     def _ensure_platform(self, session, collector) -> Product:
         """Get or create platform record for a collector."""

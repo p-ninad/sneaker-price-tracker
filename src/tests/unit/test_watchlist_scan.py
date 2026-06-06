@@ -2,6 +2,7 @@ import json
 from unittest.mock import AsyncMock
 
 from app import config as app_config
+from app.auth.passwords import hash_password
 from app.collectors.base import CollectorRegistry, ProductData
 from app.database.repository import (
     AlertRepository,
@@ -9,6 +10,7 @@ from app.database.repository import (
     PriceSnapshotRepository,
     ProductRepository,
     StockSnapshotRepository,
+    UserRepository,
 )
 from app.scheduler.jobs import ScanScheduler
 from app.services.wishlist import WishlistService
@@ -40,6 +42,14 @@ class TestWatchlistScan:
             base_url="https://www.myntra.com",
         )
 
+        user = UserRepository.create(
+            test_session,
+            username="scan_user",
+            password_hash=hash_password("secret", iterations=1000),
+            telegram_user_id="555",
+            telegram_chat_id="666",
+        )
+
         existing = ProductRepository.create_or_update(
             test_session,
             platform_id=platform.id,
@@ -60,6 +70,7 @@ class TestWatchlistScan:
             brand="Nike",
             model_name="Air Max 90",
             title="Nike Air Max 90",
+            user_id=user.id,
             platforms_to_track=["myntra"],
             size_scope=["11", "11.5", "12", "12.5"],
         )
@@ -120,6 +131,14 @@ class TestWatchlistScan:
             base_url="https://www.myntra.com",
         )
 
+        user = UserRepository.create(
+            test_session,
+            username="scan_user_2",
+            password_hash=hash_password("secret", iterations=1000),
+            telegram_user_id="556",
+            telegram_chat_id="667",
+        )
+
         ProductRepository.create_or_update(
             test_session,
             platform_id=platform.id,
@@ -140,6 +159,7 @@ class TestWatchlistScan:
             brand="Nike",
             model_name="Air Max 90",
             title="Nike Air Max 90",
+            user_id=user.id,
             platforms_to_track=["myntra"],
             size_scope=["11", "11.5", "12", "12.5"],
         )
@@ -177,6 +197,14 @@ class TestWatchlistScan:
     def test_watchlist_scan_skips_products_outside_size_scope(self, test_session, test_db_url):
         app_config.settings.database_url = test_db_url
 
+        user = UserRepository.create(
+            test_session,
+            username="scan_user_3",
+            password_hash=hash_password("secret", iterations=1000),
+            telegram_user_id="557",
+            telegram_chat_id="668",
+        )
+
         platform = PlatformRepository.create(
             test_session,
             name="myntra",
@@ -204,6 +232,7 @@ class TestWatchlistScan:
             brand="Nike",
             model_name="Air Max 90",
             title="Nike Air Max 90",
+            user_id=user.id,
             platforms_to_track=["myntra"],
             size_scope=["12.5"],
         )

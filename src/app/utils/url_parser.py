@@ -1,5 +1,6 @@
 """Utilities for parsing product URLs into platform and product identifiers."""
 
+import re
 from urllib.parse import urlparse
 from typing import Optional
 
@@ -33,6 +34,7 @@ def extract_product_id_from_url(url: str) -> Optional[str]:
         return None
 
     parsed = urlparse(url)
+    hostname = parsed.netloc.lower()
     path = parsed.path.strip("/")
 
     if not path:
@@ -41,5 +43,12 @@ def extract_product_id_from_url(url: str) -> Optional[str]:
     parts = [part for part in path.split("/") if part]
     if not parts:
         return None
+
+    if "myntra.com" in hostname:
+        numeric_parts = [part for part in parts if re.fullmatch(r"\d+", part)]
+        if numeric_parts:
+            return numeric_parts[-1]
+        if parts[-1].lower() == "buy" and len(parts) >= 2:
+            return parts[-2]
 
     return parts[-1]

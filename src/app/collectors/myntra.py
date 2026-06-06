@@ -10,7 +10,9 @@ This collector demonstrates the hybrid approach.
 
 import httpx
 import json
+import re
 from typing import Optional, List
+from urllib.parse import quote_plus, urljoin, urlparse
 from app.collectors.base import (
     BaseCollector,
     ProductData,
@@ -242,14 +244,221 @@ class MyntraCollector(BaseCollector):
     async def _discover_via_scraping(self, query: str, limit: int) -> Optional[List[ProductData]]:
         """Fallback: Discover products using Playwright + BeautifulSoup."""
         try:
-            # TODO: Implement Playwright-based scraping
-            # For MVP, this is deferred
-            logger.info("HTML scraping not yet implemented for Myntra", platform="myntra")
-            return None
+            candidate_urls = await self._discover_product_urls_via_http(query, limit)
+            if not candidate_urls:
+                candidate_urls = await self._discover_product_urls_via_playwright(query, limit)
+
+            if not candidate_urls:
+                logger.info(
+                    "Myntra discovery found no product URLs",
+                    platform="myntra",
+                    query=query,
+                )
+                return None
+
+            products: list[ProductData] = []
+            seen_urls: set[str] = set()
+            for url in candidate_urls:
+                normalized_url = url.strip()
+                if not normalized_url or normalized_url in seen_urls:
+                    continue
+                seen_urls.add(normalized_url)
+
+                product_id = extract_product_id_from_url(normalized_url) or normalized_url
+                product = await self._fetch_details_via_http(
+                    product_id,
+                    source_url=normalized_url,
+                )
+                if product is None:
+                    product = await self._fetch_details_via_scraping(
+                        product_id,
+                        source_url=normalized_url,
+                    )
+                if product is None:
+                    continue
+
+                products.append(product)
+                if len(products) >= limit:
+                    break
+
+            return products or None
 
         except Exception as e:
             logger.debug(f"HTML scraping failed: {e}", platform="myntra")
             return None
+
+    async def _discover_product_urls_via_http(self, query: str, limit: int) -> list[str]:
+        """Discover candidate product URLs from Myntra search HTML."""
+        try:
+            for search_url in self._build_search_urls(query):
+                try:
+                    async with httpx.AsyncClient(
+                        timeout=settings.request_timeout_seconds,
+                        headers=self.get_browser_headers(),
+                        follow_redirects=True,
+                    ) as client:
+                        response = await client.get(search_url)
+                        if response.status_code >= 400:
+                            continue
+
+                        html = response.text
+                        if self._html_looks_blocked(html):
+                            continue
+
+                        urls = self._extract_product_urls_from_html(html, str(response.url))
+                        if urls:
+                            return urls[:limit]
+                except Exception as exc:
+                    logger.debug(
+                        "HTTP search discovery failed",
+                        platform="myntra",
+                        search_url=search_url,
+                        error=str(exc),
+                    )
+                    continue
+        except Exception as exc:
+            logger.debug(
+                "HTTP search discovery aborted",
+                platform="myntra",
+                error=str(exc),
+            )
+        return []
+
+    async def _discover_product_urls_via_playwright(self, query: str, limit: int) -> list[str]:
+        """Discover candidate product URLs from Myntra search pages with Playwright."""
+        try:
+            from playwright.async_api import async_playwright
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=settings.playwright_headless,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-http2",
+                        "--disable-quic",
+                    ],
+                )
+                context = await browser.new_context(
+                    user_agent=self.get_browser_headers()["User-Agent"],
+                    locale="en-US",
+                    viewport={"width": 1366, "height": 768},
+                    ignore_https_errors=True,
+                )
+                page = await context.new_page()
+
+                try:
+                    for search_url in self._build_search_urls(query):
+                        try:
+                            await page.goto(
+                                search_url,
+                                timeout=settings.browser_timeout_ms,
+                                wait_until="domcontentloaded",
+                            )
+                            html = await page.content()
+                            if self._html_looks_blocked(html):
+                                continue
+
+                            urls = self._extract_product_urls_from_html(html, page.url)
+                            if urls:
+                                return urls[:limit]
+                        except Exception as exc:
+                            logger.debug(
+                                "Playwright search discovery failed for URL",
+                                platform="myntra",
+                                search_url=search_url,
+                                error=str(exc),
+                            )
+                            continue
+                finally:
+                    await context.close()
+                    await browser.close()
+        except Exception as exc:
+            logger.debug(
+                "Playwright search discovery failed",
+                platform="myntra",
+                error=str(exc),
+            )
+        return []
+
+    @staticmethod
+    def _build_search_urls(query: str) -> list[str]:
+        """Build candidate Myntra search URLs for a discovery query."""
+        cleaned_query = str(query or "").strip()
+        encoded_query = quote_plus(cleaned_query or "sneaker")
+        slug = re.sub(r"[^a-z0-9]+", "-", cleaned_query.lower()).strip("-") or "sneaker"
+
+        return list(
+            dict.fromkeys(
+                [
+                    f"https://www.myntra.com/search?rawQuery={encoded_query}",
+                    f"https://www.myntra.com/{slug}?rawQuery={encoded_query}",
+                    f"https://www.myntra.com/{slug}",
+                    f"https://www.myntra.com/catalog?rawQuery={encoded_query}",
+                ]
+            )
+        )
+
+    @staticmethod
+    def _html_looks_blocked(html: str) -> bool:
+        """Detect Myntra anti-bot pages."""
+        blocked_markers = (
+            "access denied",
+            "request unsuccessful",
+            "bot verification",
+            "please verify you are a human",
+            "captcha-delivery",
+        )
+        lower_html = html.lower()
+        return any(marker in lower_html for marker in blocked_markers)
+
+    def _extract_product_urls_from_html(self, html: str, base_url: str) -> list[str]:
+        """Extract candidate Myntra product URLs from search result HTML."""
+        try:
+            from bs4 import BeautifulSoup
+
+            soup = BeautifulSoup(html, "html.parser")
+            candidate_urls: list[str] = []
+
+            for anchor in soup.select("a[href]"):
+                href = anchor.get("href")
+                if not href:
+                    continue
+
+                absolute_url = urljoin(base_url, href)
+                if self._is_product_url(absolute_url):
+                    candidate_urls.append(absolute_url)
+
+            if not candidate_urls:
+                for match in re.findall(r'(?:(?:https?:)?//www\.myntra\.com[^"\']+|/[^"\']+)', html):
+                    absolute_url = urljoin(base_url, match)
+                    if self._is_product_url(absolute_url):
+                        candidate_urls.append(absolute_url)
+
+            return list(dict.fromkeys(candidate_urls))
+        except Exception as exc:
+            logger.debug(
+                "Failed to extract product URLs from HTML",
+                platform="myntra",
+                error=str(exc),
+            )
+            return []
+
+    @staticmethod
+    def _is_product_url(url: str) -> bool:
+        """Return True when a URL looks like a Myntra product page."""
+        parsed = urlparse(url)
+        hostname = parsed.netloc.lower()
+        if "myntra.com" not in hostname:
+            return False
+
+        path_parts = [part for part in parsed.path.strip("/").split("/") if part]
+        if not path_parts:
+            return False
+
+        if path_parts[-1].lower() != "buy" and not path_parts[-1].isdigit():
+            return False
+
+        return any(part.isdigit() for part in path_parts)
 
     async def _fetch_details_via_api(self, product_id: str) -> Optional[ProductData]:
         """Fetch product details from API."""
@@ -510,7 +719,6 @@ class MyntraCollector(BaseCollector):
         """Parse product data from HTML using BeautifulSoup."""
         try:
             from bs4 import BeautifulSoup
-            import re
 
             soup = BeautifulSoup(html, "html.parser")
 
@@ -595,9 +803,11 @@ class MyntraCollector(BaseCollector):
 
             # Extract brand and model from title
             brand, model = self.normalize_product_name(title)
+            model = self._clean_myntra_model_name(title, brand, fallback=model)
 
             # Try to extract stock status
             in_stock = "out of stock" not in html.lower()
+            sizes_available = self._extract_sizes_from_html(html)
 
             # Try to extract image
             image_url = None
@@ -615,6 +825,7 @@ class MyntraCollector(BaseCollector):
                 discounted_price=discounted_price,
                 currency="INR",
                 in_stock=in_stock,
+                sizes_available=sizes_available,
                 image_url=image_url,
                 description=None,
                 sku=None,
@@ -626,6 +837,67 @@ class MyntraCollector(BaseCollector):
         except Exception as e:
             logger.debug(f"Failed to parse HTML product: {e}")
             return None
+
+    @staticmethod
+    def _clean_myntra_model_name(title: str, brand: str, fallback: str) -> str:
+        """Clean noisy e-commerce title copy into a model-friendly value."""
+        cleaned = re.sub(r"\s+", " ", str(title or "").strip())
+        cleaned = re.sub(r"^buy\s+", "", cleaned, flags=re.IGNORECASE)
+
+        brand_name = str(brand or "").strip()
+        if brand_name:
+            cleaned = re.sub(
+                rf"^{re.escape(brand_name)}\s+",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+
+        cleaned = re.sub(
+            r"\b(unisex|men|mens|women|womens)\b",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\b(footwear|sneaker|sneakers|shoe|shoes)\b.*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = cleaned.replace("-", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+        return cleaned or fallback
+
+    @staticmethod
+    def _extract_sizes_from_html(html: str) -> Optional[List[str]]:
+        """Extract available UK sizes from embedded Myntra page data."""
+        candidates = set()
+
+        patterns = [
+            r'"sizeDisplayName"\s*:\s*"([^"]+)"',
+            r'"displaySize"\s*:\s*"([^"]+)"',
+            r'"size"\s*:\s*"((?:UK\s*)?\d+(?:\.\d+)?)"',
+            r'"label"\s*:\s*"((?:UK\s*)?\d+(?:\.\d+)?)"',
+        ]
+        for pattern in patterns:
+            for match in re.findall(pattern, html, flags=re.IGNORECASE):
+                value = str(match).strip().upper()
+                if not value:
+                    continue
+                number_match = re.search(r"(\d+(?:\.\d+)?)", value)
+                if number_match:
+                    candidates.add(f"UK{number_match.group(1)}")
+
+        if not candidates:
+            return None
+
+        def _size_key(size_token: str):
+            number = re.search(r"(\d+(?:\.\d+)?)", size_token)
+            return float(number.group(1)) if number else 0.0
+
+        return sorted(candidates, key=_size_key)
 
     def _parse_api_product(self, data: dict) -> Optional[ProductData]:
         """Parse product data from API response."""

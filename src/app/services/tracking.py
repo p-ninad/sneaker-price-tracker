@@ -12,6 +12,7 @@ from app.database.repository import (
     StockSnapshotRepository,
     AlertRepository,
     ProductRepository,
+    WatchlistRepository,
 )
 from app.config import settings
 
@@ -206,15 +207,32 @@ class TrackingService:
         
         alerts: List[Alert] = []
         
+        watchlist_rule = WatchlistRepository.get_by_product_id(session, analysis.product.id)
+
         for change_type in analysis.change_types:
             alert = None
             
             if change_type == ChangeType.PRICE_DROP and analysis.price_change:
-                if analysis.price_change.is_significant():
+                threshold_price = (
+                    watchlist_rule.price_alert_threshold
+                    if watchlist_rule and watchlist_rule.price_alert_threshold is not None
+                    else None
+                )
+                price_matches_threshold = (
+                    threshold_price is not None
+                    and analysis.price_change.new_price <= threshold_price
+                )
+                if price_matches_threshold or analysis.price_change.is_significant():
+                    threshold_note = (
+                        f"\nThreshold: ₹{threshold_price:.0f}"
+                        if threshold_price is not None
+                        else ""
+                    )
                     message = (
                         f"Price dropped on {analysis.product.brand} {analysis.product.model_name}\n"
                         f"₹{analysis.price_change.old_price:.0f} → ₹{analysis.price_change.new_price:.0f}\n"
                         f"Discount: {analysis.price_change.change_percentage:.1f}%"
+                        f"{threshold_note}"
                     )
                     alert = AlertRepository.create(
                         session,
@@ -224,7 +242,11 @@ class TrackingService:
                     )
             
             elif change_type == ChangeType.BACK_IN_STOCK:
-                if settings.restock_notification_enabled:
+                restock_enabled = settings.restock_notification_enabled
+                if watchlist_rule is not None:
+                    restock_enabled = watchlist_rule.restock_alert
+
+                if restock_enabled:
                     message = (
                         f"{analysis.product.brand} {analysis.product.model_name} is back in stock!"
                     )

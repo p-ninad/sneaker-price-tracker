@@ -36,6 +36,9 @@ class Settings(BaseSettings):
         default=None, alias="TELEGRAM_BOT_TOKEN"
     )
     telegram_chat_id: Optional[str] = Field(default=None, alias="TELEGRAM_CHAT_ID")
+    telegram_require_chat_id: bool = Field(
+        default=True, alias="TELEGRAM_REQUIRE_CHAT_ID"
+    )
 
     # === Scraping ===
     playwright_headless: bool = Field(default=True, alias="PLAYWRIGHT_HEADLESS")
@@ -80,16 +83,25 @@ class Settings(BaseSettings):
         default=True, alias="RESTOCK_NOTIFICATION_ENABLED"
     )
 
+    # === Authentication ===
+    auth_session_cookie_name: str = Field(
+        default="price_tracker_session", alias="AUTH_SESSION_COOKIE_NAME"
+    )
+    auth_session_ttl_hours: int = Field(default=24 * 7, alias="AUTH_SESSION_TTL_HOURS")
+    auth_password_iterations: int = Field(
+        default=310_000, alias="AUTH_PASSWORD_ITERATIONS"
+    )
+    auth_bootstrap_token: Optional[str] = Field(
+        default=None, alias="AUTH_BOOTSTRAP_TOKEN"
+    )
+
     @model_validator(mode="after")
     def validate_secret_configuration(self):
         """Fail fast when the runtime configuration is internally inconsistent."""
-        telegram_pair_configured = bool(self.telegram_bot_token) or bool(
-            self.telegram_chat_id
-        )
+        if self.telegram_chat_id and not self.telegram_bot_token:
+            raise ValueError("TELEGRAM_BOT_TOKEN must be set when TELEGRAM_CHAT_ID is set.")
 
-        if telegram_pair_configured and not (
-            self.telegram_bot_token and self.telegram_chat_id
-        ):
+        if self.telegram_bot_token and self.telegram_require_chat_id and not self.telegram_chat_id:
             raise ValueError(
                 "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must both be set together."
             )

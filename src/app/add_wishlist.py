@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     add_parser = subparsers.add_parser("add", help="Add a new wishlist entry")
+    add_parser.add_argument("--user-id", type=int, required=True)
     add_parser.add_argument("--url", required=True)
     add_parser.add_argument("--brand", required=True)
     add_parser.add_argument("--model", required=True, dest="model_name")
@@ -39,12 +40,15 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser.add_argument("--include-inactive", action="store_true")
 
     disable_parser = subparsers.add_parser("disable", help="Disable a wishlist entry")
+    disable_parser.add_argument("--user-id", type=int, required=True)
     disable_parser.add_argument("--url", required=True)
 
     enable_parser = subparsers.add_parser("enable", help="Enable a wishlist entry")
+    enable_parser.add_argument("--user-id", type=int, required=True)
     enable_parser.add_argument("--url", required=True)
 
     delete_parser = subparsers.add_parser("delete", help="Delete a wishlist entry")
+    delete_parser.add_argument("--user-id", type=int, required=True)
     delete_parser.add_argument("--url", required=True)
 
     return parser
@@ -65,6 +69,7 @@ def main() -> None:
                 brand=args.brand,
                 model_name=args.model_name,
                 title=args.title,
+                user_id=args.user_id,
                 platforms_to_track=parse_csv(args.platforms),
                 size_scope=parse_csv(args.sizes),
                 notes=args.notes,
@@ -85,7 +90,7 @@ def main() -> None:
             return
 
         if args.command == "disable":
-            updated = WishlistService.set_active(session, args.url, False)
+            updated = WishlistService.set_active(session, args.url, args.user_id, False)
             if updated is None:
                 print(f"No wishlist entry found for {args.url}")
                 return
@@ -94,7 +99,7 @@ def main() -> None:
             return
 
         if args.command == "enable":
-            updated = WishlistService.set_active(session, args.url, True)
+            updated = WishlistService.set_active(session, args.url, args.user_id, True)
             if updated is None:
                 print(f"No wishlist entry found for {args.url}")
                 return
@@ -103,7 +108,7 @@ def main() -> None:
             return
 
         if args.command == "delete":
-            deleted = WishlistService.delete(session, args.url)
+            deleted = WishlistService.delete(session, args.url, args.user_id)
             if not deleted:
                 print(f"No wishlist entry found for {args.url}")
                 return

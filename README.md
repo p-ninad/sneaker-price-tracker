@@ -76,6 +76,9 @@ make docker-build
 # Start with docker-compose (includes reverse proxy + auth)
 make docker-run
 
+# Apply database migrations when using Postgres
+make db-migrate
+
 # View logs
 make docker-logs
 
@@ -83,21 +86,71 @@ make docker-logs
 make docker-stop
 ```
 
+### Operational Runbook
+
+For a detailed, current-state guide covering local runs, Docker, tests, VPS deployment, and Telegram verification, see `docs/OPERATIONS_RUNBOOK.md`.
+
 ### Accessing the Dashboard
 
 After starting with `docker-compose`, the dashboard is available at:
 - **Local**: `http://localhost`
 - **Via reverse proxy**: The dashboard is only exposed through the Caddy reverse proxy (port 80/443), not directly
-- **Credentials**: Use the `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` from your `.env` file
+- **First-time setup**: Open `http://localhost/bootstrap` and create the first admin account using `AUTH_BOOTSTRAP_TOKEN`
+- **Postgres**: The compose stack now brings up a Postgres container and runs the app against `DATABASE_URL=postgresql+psycopg://...`
 
 #### Authentication
 
-The dashboard is protected with HTTP Basic Authentication by default. When you access it, your browser will prompt you for a username and password.
+The dashboard now uses a form-based login flow with server-side sessions. Only admin users can log in.
 
 ```bash
-# Using curl with basic auth:
-curl -u operator:changeme-in-production http://localhost/
+# Log in through the browser at /login after bootstrapping the first admin
+curl -i http://localhost/login
 ```
+
+### Telegram Bot UX
+
+Regular users interact only through Telegram. The bot accepts structured inputs rather than free-form chat:
+
+- `/start` registers the Telegram identity or refreshes the profile
+- `/status` reports bot uptime and alert usage
+- `/add` runs a guided prompt flow for one alert at a time
+- `/list` shows the user’s current alerts
+- `/edit <id> key:value ...` updates alert metadata such as notes, sizes, or platforms
+- `/pause <id>` and `/resume <id>` toggle an alert
+- `/delete <id>` removes an alert
+- `/cancel` aborts an in-progress flow
+
+For `/add`, the bot expects one value per step:
+
+- full `http(s)` URL
+- plain-text brand, model, and title
+- comma-separated platforms such as `myntra, ajio`
+- comma-separated numeric sizes such as `8, 8.5, 9`
+- optional notes
+
+Regular users can keep at most 5 active alerts for now.
+Admins must select a Telegram-registered user in the dashboard before creating, updating, or deleting wishlist items.
+The dashboard user picker searches by display name and Telegram ID, and only users who have already used `/start` are selectable.
+
+#### Runtime model
+
+Run the Telegram bot as its own process with `python -m app.bot.main` or the `telegram-bot` service in `docker-compose.yml`.
+It uses polling so the VPS only needs outbound network access to Telegram, and it can restart independently from the web dashboard.
+
+#### Deploy readiness
+
+Before bringing a VPS online, run `make ready` to verify the database can initialize and that each service has the minimum required configuration.
+You can scope the check with `make ready SERVICE=dashboard`, `make ready SERVICE=main`, or `make ready SERVICE=telegram-bot`.
+
+#### Admin Assistant
+
+Admins can use the `Ask Assistant` page in the dashboard to ask natural-language questions about the current tracker state.
+The assistant answers from live data first and can optionally use `OPENAI_API_KEY` for richer phrasing, but it will not invent data that is not present in the database.
+
+#### Watchlist Rules
+
+Open a product trend page from the dashboard to set a per-product price threshold or disable restock alerts.
+Those rules feed the alert engine during watchlist scans, so price-drop and restock notifications can be tuned per product instead of using only global defaults.
 
 #### Configuring HTTPS
 
@@ -115,11 +168,17 @@ Use `.env.example` as the template for local development and fill in the values 
 
 For Docker or a VPS, prefer exporting secrets directly in the runtime environment or mounting them from a secure file. The app will load `.env` automatically when it exists, otherwise it falls back to environment variables only.
 
+For Postgres deployments, set `DATABASE_URL` to a `postgresql+psycopg://...` URL and run `make db-migrate` before starting the app.
+
 Example environment variables:
 
 ```env
 ENV=production
 LOG_LEVEL=INFO
+DATABASE_URL=postgresql+psycopg://price_tracker:changeme@postgres:5432/price_tracker
+POSTGRES_DB=price_tracker
+POSTGRES_USER=price_tracker
+POSTGRES_PASSWORD=changeme
 OPENAI_API_KEY=sk-...
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 TELEGRAM_CHAT_ID=987654321
@@ -229,7 +288,7 @@ This hybrid approach ensures:
 - **scan_jobs**: Audit log of scraping runs
 - **watchlist**: User-watched products
 
-All tables are indexed for query performance and designed for future Postgres migration.
+All tables are indexed for query performance and are backed by Alembic migrations for SQLite and Postgres deployments.
 
 ## Sneaker Normalization
 
@@ -365,10 +424,14 @@ All events logged to stdout (captured by Docker/systemd).
 - [ ] AI normalization service
 
 ### 🟡 Phase 5: Advanced Features
-- [ ] Conversational queries (ChatGPT)
-- [ ] Web dashboard
-- [ ] Postgres migration
-- [ ] Historical trend charts
+- [x] Conversational queries (ChatGPT)
+- [x] Web dashboard
+- [x] Postgres migration
+- [x] Historical trend charts
+
+### 🟡 Phase 6: Alert Rules
+- [x] Watchlist rules management
+- [x] Rule-aware alert engine
 
 ## Roadmap
 

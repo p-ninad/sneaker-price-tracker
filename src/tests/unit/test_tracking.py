@@ -14,6 +14,7 @@ from app.database.repository import (
     PlatformRepository,
     ProductRepository,
     AlertRepository,
+    WatchlistRepository,
 )
 
 
@@ -256,6 +257,59 @@ class TestTrackingService:
         assert ChangeType.BACK_IN_STOCK in analysis.change_types
         assert analysis.stock_change is not None
         assert analysis.stock_change.became_available() is True
+
+    def test_create_alerts_respects_watchlist_threshold(self, service, test_session, product_with_platform):
+        """Test that watchlist thresholds influence price-drop alerts."""
+        WatchlistRepository.upsert(
+            test_session,
+            product_id=product_with_platform.id,
+            price_alert_threshold=8500.0,
+            restock_alert=True,
+            notes="Notify me only below this level",
+        )
+
+        analysis = service.analyze_product_update(
+            test_session,
+            product_with_platform,
+            new_listed_price=12000.0,
+            new_discounted_price=8400.0,
+            new_discount_percentage=30.0,
+            new_in_stock=True,
+            new_sizes_available='["6", "7", "8", "9"]',
+        )
+
+        alerts = service.create_alerts_from_analysis(test_session, analysis)
+
+        assert len(alerts) == 1
+        assert alerts[0].alert_type == "price_drop"
+        assert "Threshold: ₹8500" in alerts[0].message
+
+    def test_create_alerts_respects_restock_toggle(self, service, test_session, product_with_platform):
+        """Test that restock alerts can be disabled per watchlist rule."""
+        WatchlistRepository.upsert(
+            test_session,
+            product_id=product_with_platform.id,
+            price_alert_threshold=None,
+            restock_alert=False,
+            notes=None,
+        )
+
+        analysis = service.analyze_product_update(
+            test_session,
+            product_with_platform,
+            new_listed_price=12000.0,
+            new_discounted_price=10000.0,
+            new_discount_percentage=16.67,
+            new_in_stock=False,
+            new_sizes_available='["6", "7", "8", "9"]',
+        )
+
+        analysis.stock_change = StockChange(old_in_stock=False, new_in_stock=True, changed=True)
+        analysis.change_types = [ChangeType.BACK_IN_STOCK]
+
+        alerts = service.create_alerts_from_analysis(test_session, analysis)
+
+        assert alerts == []
     
     def test_analyze_size_changes(self, service, test_session, product_with_platform):
         """Test detecting size availability changes."""

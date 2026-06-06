@@ -1,21 +1,46 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: price-tracker-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-price_tracker}
+      POSTGRES_USER: ${POSTGRES_USER:-price_tracker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-price_tracker} -d ${POSTGRES_DB:-price_tracker}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - price-tracker-net
+
   price-tracker:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: price-tracker
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       ENV: production
       LOG_LEVEL: DEBUG
-      DATABASE_URL: sqlite:////app/data/price_tracker.db
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-price_tracker}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-price_tracker}
       PLAYWRIGHT_HEADLESS: "true"
       ENABLE_SCHEDULER: "true"
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-    volumes:
-      - ./data:/app/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.readiness", "--service", "main"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
     logging:
       driver: "json-file"
       options:
@@ -30,15 +55,21 @@ services:
       dockerfile: Dockerfile
     container_name: price-tracker-dashboard
     command: ["python", "-m", "app.dashboard", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       ENV: production
       LOG_LEVEL: INFO
-      DATABASE_URL: sqlite:////app/data/price_tracker.db
-      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-admin}
-      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-changeme}
-    volumes:
-      - ./data:/app/data
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-price_tracker}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-price_tracker}
+      AUTH_BOOTSTRAP_TOKEN: ${AUTH_BOOTSTRAP_TOKEN:-changeme-in-production}
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.readiness", "--service", "dashboard"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
     logging:
       driver: "json-file"
       options:
@@ -48,6 +79,36 @@ services:
       - price-tracker-net
     expose:
       - "8000"
+
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: price-tracker-telegram-bot
+    command: ["python", "-m", "app.bot.main"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ENV: production
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-price_tracker}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-price_tracker}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_REQUIRE_CHAT_ID: "false"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.readiness", "--service", "telegram-bot"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - price-tracker-net
 
   caddy:
     image: caddy:2-alpine
@@ -61,6 +122,7 @@ services:
       - caddy_config:/config
     depends_on:
       - dashboard
+      - telegram-bot
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -73,6 +135,7 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  pgdata:
 
 networks:
   price-tracker-net:

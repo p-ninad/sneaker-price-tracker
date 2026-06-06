@@ -61,11 +61,15 @@ class WishlistService:
         brand: str,
         model_name: str,
         title: str,
+        user_id: int,
         platforms_to_track: Optional[Iterable[str]] = None,
         size_scope: Optional[Iterable[str]] = None,
         notes: Optional[str] = None,
     ) -> WishlistEntry:
         """Add a wishlist entry from a product URL and metadata."""
+        if user_id is None:
+            raise ValueError("user_id is required")
+
         platform = extract_platform_from_url(url)
         if not platform:
             raise ValueError("Unsupported product URL")
@@ -77,7 +81,15 @@ class WishlistService:
         size_scope_value = WishlistService._normalize_size_scope(size_scope)
         platforms_value = WishlistService._normalize_platforms(platforms_to_track, platform)
 
-        existing = session.query(WishlistEntry).filter(WishlistEntry.source_url == url).first()
+        existing_query = (
+            session.query(WishlistEntry)
+            .filter(
+                WishlistEntry.source_url == url,
+                WishlistEntry.user_id == user_id,
+            )
+        )
+
+        existing = existing_query.first()
         if existing:
             existing.platform = platform
             existing.brand = brand
@@ -88,11 +100,14 @@ class WishlistService:
             existing.platforms_to_track = json.dumps(platforms_value)
             existing.notes = notes
             existing.is_active = True
+            if user_id is not None:
+                existing.user_id = user_id
             session.commit()
             logger.info("wishlist_entry_updated", source_url=url, normalized_name=normalized_name)
             return existing
 
         wishlist_entry = WishlistEntry(
+            user_id=user_id,
             source_url=url,
             platform=platform,
             brand=brand,
@@ -120,9 +135,36 @@ class WishlistService:
         )
 
     @staticmethod
+    def get_active_for_user(session: Session, user_id: int) -> list[WishlistEntry]:
+        return (
+            session.query(WishlistEntry)
+            .filter(WishlistEntry.user_id == user_id, WishlistEntry.is_active == True)
+            .order_by(WishlistEntry.created_at.desc())
+            .all()
+        )
+
+    @staticmethod
+    def count_active_for_user(session: Session, user_id: int) -> int:
+        return (
+            session.query(WishlistEntry)
+            .filter(WishlistEntry.user_id == user_id, WishlistEntry.is_active == True)
+            .count()
+        )
+
+    @staticmethod
     def get_all(session: Session) -> list[WishlistEntry]:
         """Return all wishlist entries sorted by newest first."""
         return session.query(WishlistEntry).order_by(WishlistEntry.created_at.desc()).all()
+
+    @staticmethod
+    def get_all_for_user(session: Session, user_id: int) -> list[WishlistEntry]:
+        """Return all wishlist entries for one user sorted by newest first."""
+        return (
+            session.query(WishlistEntry)
+            .filter(WishlistEntry.user_id == user_id)
+            .order_by(WishlistEntry.created_at.desc())
+            .all()
+        )
 
     @staticmethod
     def get_by_url(session: Session, url: str) -> WishlistEntry | None:
@@ -130,9 +172,21 @@ class WishlistService:
         return session.query(WishlistEntry).filter(WishlistEntry.source_url == url).first()
 
     @staticmethod
-    def set_active(session: Session, url: str, is_active: bool) -> WishlistEntry | None:
+    def get_by_url_for_user(session: Session, url: str, user_id: int) -> WishlistEntry | None:
+        """Return a user's wishlist entry by source URL."""
+        return (
+            session.query(WishlistEntry)
+            .filter(WishlistEntry.source_url == url, WishlistEntry.user_id == user_id)
+            .first()
+        )
+
+    @staticmethod
+    def set_active(session: Session, url: str, user_id: int, is_active: bool) -> WishlistEntry | None:
         """Enable or disable an existing wishlist entry."""
-        wishlist_entry = WishlistService.get_by_url(session, url)
+        if user_id is None:
+            raise ValueError("user_id is required")
+
+        wishlist_entry = WishlistService.get_by_url_for_user(session, url, user_id)
         if wishlist_entry is None:
             return None
 
@@ -141,9 +195,12 @@ class WishlistService:
         return wishlist_entry
 
     @staticmethod
-    def delete(session: Session, url: str) -> bool:
+    def delete(session: Session, url: str, user_id: int) -> bool:
         """Delete a wishlist entry by source URL."""
-        wishlist_entry = WishlistService.get_by_url(session, url)
+        if user_id is None:
+            raise ValueError("user_id is required")
+
+        wishlist_entry = WishlistService.get_by_url_for_user(session, url, user_id)
         if wishlist_entry is None:
             return False
 

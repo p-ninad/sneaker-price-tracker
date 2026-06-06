@@ -1,6 +1,5 @@
 """SQLAlchemy ORM models for the price tracker."""
 
-from datetime import datetime
 from sqlalchemy import (
     Column,
     Integer,
@@ -18,6 +17,63 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 Base = declarative_base()
+
+
+class User(Base):
+    """Application user for admin access and Telegram identity linkage."""
+
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    username = Column(String(80), nullable=False, unique=True, index=True)
+    display_name = Column(String(120), nullable=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(20), nullable=False, default="user", index=True)
+
+    telegram_user_id = Column(String(50), nullable=True, unique=True, index=True)
+    telegram_chat_id = Column(String(50), nullable=True, unique=True, index=True)
+    is_active = Column(Boolean, default=True, index=True)
+    last_login_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    sessions = relationship(
+        "AuthSession", back_populates="user", cascade="all, delete-orphan"
+    )
+    wishlist_entries = relationship(
+        "WishlistEntry", back_populates="owner", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("idx_user_role_active", "role", "is_active"),
+        Index("idx_user_telegram_identity", "telegram_user_id", "telegram_chat_id"),
+    )
+
+
+class AuthSession(Base):
+    """Persisted login session for the web portal."""
+
+    __tablename__ = "auth_sessions"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    session_token_hash = Column(String(64), nullable=False, unique=True, index=True)
+
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(String(255), nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    last_seen_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    revoked_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="sessions")
+
+    __table_args__ = (
+        Index("idx_auth_session_user_expires", "user_id", "expires_at"),
+        Index("idx_auth_session_revoked", "revoked_at"),
+    )
 
 
 class Platform(Base):
@@ -210,7 +266,8 @@ class WishlistEntry(Base):
     __tablename__ = "wishlist_entries"
 
     id = Column(Integer, primary_key=True)
-    source_url = Column(String(500), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    source_url = Column(String(500), nullable=False, index=True)
     platform = Column(String(50), nullable=False, index=True)
     brand = Column(String(100), nullable=False, index=True)
     model_name = Column(String(200), nullable=False, index=True)
@@ -224,7 +281,11 @@ class WishlistEntry(Base):
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
+    owner = relationship("User", back_populates="wishlist_entries")
+
     __table_args__ = (
+        UniqueConstraint("user_id", "source_url", name="uq_wishlist_user_source_url"),
+        Index("idx_wishlist_user_active", "user_id", "is_active"),
         Index("idx_wishlist_active_updated", "is_active", "updated_at"),
         Index("idx_wishlist_normalized_name", "normalized_name"),
     )

@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from app.database.repository import PlatformRepository, ProductRepository
+from app.auth.passwords import hash_password
+from app.database.repository import PlatformRepository, ProductRepository, UserRepository
 from app.services.wishlist import WishlistService
 from app.utils.url_parser import extract_platform_from_url
 
@@ -27,13 +28,24 @@ class TestWishlistService:
             base_url="https://www.myntra.com",
         )
 
-    def test_add_from_url_creates_wishlist_item(self, test_session, platform):
+    @pytest.fixture
+    def user(self, test_session):
+        return UserRepository.create(
+            test_session,
+            username="tg_user",
+            password_hash=hash_password("secret", iterations=1000),
+            telegram_user_id="111",
+            telegram_chat_id="222",
+        )
+
+    def test_add_from_url_creates_wishlist_item(self, test_session, platform, user):
         wishlist = WishlistService.add_from_url(
             test_session,
             url="https://www.myntra.com/p/abc",
             brand="Nike",
             model_name="Air Max 90",
             title="Nike Air Max 90",
+            user_id=user.id,
             platforms_to_track=["myntra", "ajio"],
             size_scope=["11", "11.5", "12", "12.5"],
         )
@@ -46,7 +58,7 @@ class TestWishlistService:
         assert json.loads(wishlist.platforms_to_track) == ["myntra", "ajio"]
         assert wishlist.is_active is True
 
-    def test_find_exact_matches(self, test_session, platform):
+    def test_find_exact_matches(self, test_session, platform, user):
         ProductRepository.create_or_update(
             test_session,
             platform_id=platform.id,
@@ -67,6 +79,7 @@ class TestWishlistService:
             brand="Nike",
             model_name="Air Max 90",
             title="Nike Air Max 90",
+            user_id=user.id,
             platforms_to_track=["myntra"],
             size_scope=["11", "12"],
         )
@@ -77,13 +90,14 @@ class TestWishlistService:
         assert matches[0].brand == "Nike"
         assert matches[0].model_name == "Air Max 90"
 
-    def test_list_all_and_toggle_active_state(self, test_session, platform):
+    def test_list_all_and_toggle_active_state(self, test_session, platform, user):
         WishlistService.add_from_url(
             test_session,
             url="https://www.myntra.com/p/abc",
             brand="Nike",
             model_name="Air Max 90",
             title="Nike Air Max 90",
+            user_id=user.id,
             platforms_to_track=["myntra"],
             size_scope=["11"],
         )
@@ -92,25 +106,26 @@ class TestWishlistService:
         assert len(entries) == 1
         assert entries[0].is_active is True
 
-        updated = WishlistService.set_active(test_session, "https://www.myntra.com/p/abc", False)
+        updated = WishlistService.set_active(test_session, "https://www.myntra.com/p/abc", user.id, False)
         assert updated is not None
         assert updated.is_active is False
 
         all_entries = WishlistService.get_all(test_session)
         assert all_entries[0].is_active is False
 
-    def test_delete_removes_wishlist_entry(self, test_session, platform):
+    def test_delete_removes_wishlist_entry(self, test_session, platform, user):
         WishlistService.add_from_url(
             test_session,
             url="https://www.myntra.com/p/abc",
             brand="Nike",
             model_name="Air Max 90",
             title="Nike Air Max 90",
+            user_id=user.id,
             platforms_to_track=["myntra"],
             size_scope=["11"],
         )
 
-        deleted = WishlistService.delete(test_session, "https://www.myntra.com/p/abc")
+        deleted = WishlistService.delete(test_session, "https://www.myntra.com/p/abc", user.id)
         assert deleted is True
 
         remaining = WishlistService.get_all(test_session)

@@ -36,9 +36,5 @@ RUN groupadd --system appuser && \
 
 USER appuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "import sqlite3; conn = sqlite3.connect('/app/data/price_tracker.db'); conn.execute('SELECT 1'); conn.close()"
-
 # Run application
 CMD ["python", "-m", "app.main"]
