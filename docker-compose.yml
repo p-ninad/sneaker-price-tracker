@@ -6,8 +6,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-price_tracker}
       POSTGRES_USER: ${POSTGRES_USER:-price_tracker}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+    tmpfs:
+      - /var/lib/postgresql/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-price_tracker} -d ${POSTGRES_DB:-price_tracker}"]
@@ -135,7 +135,6 @@ services:
 volumes:
   caddy_data:
   caddy_config:
-  pgdata:
 
 networks:
   price-tracker-net:

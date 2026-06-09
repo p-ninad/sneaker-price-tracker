@@ -25,6 +25,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install --with-deps chromium && \
     chmod -R a+rX /ms-playwright
 
+# Copy Alembic configuration and migrations so startup can run upgrades
+COPY alembic.ini /app/alembic.ini
+COPY migrations/ /app/migrations/
+
 # Copy application code
 COPY src/ /app/src/
 

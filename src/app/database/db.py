@@ -84,7 +84,9 @@ def run_migrations() -> None:
 
 def init_db() -> None:
     """Initialize the database schema for the configured backend."""
-    run_migrations()
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database schema initialized", database_url=config.settings.database_url)
 
 
 def get_session() -> Session:
