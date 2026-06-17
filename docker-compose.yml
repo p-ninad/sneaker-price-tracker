@@ -17,6 +17,23 @@ services:
     networks:
       - price-tracker-net
 
+  database-bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: price-tracker-database-bootstrap
+    command: ["python", "-m", "app.database.bootstrap", "--reset"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ENV: production
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-price_tracker}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-price_tracker}
+    restart: "no"
+    networks:
+      - price-tracker-net
+
   price-tracker:
     build:
       context: .
@@ -25,6 +42,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      database-bootstrap:
+        condition: service_completed_successfully
     environment:
       ENV: production
       LOG_LEVEL: DEBUG
@@ -58,6 +77,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      database-bootstrap:
+        condition: service_completed_successfully
     environment:
       ENV: production
       LOG_LEVEL: INFO
@@ -89,6 +110,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      database-bootstrap:
+        condition: service_completed_successfully
     environment:
       ENV: production
       LOG_LEVEL: INFO

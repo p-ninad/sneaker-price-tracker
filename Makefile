@@ -2,7 +2,7 @@
 
 SERVICE ?= all
 
-.PHONY: help install run dev dashboard ready test lint format clean docker-build docker-run docker-stop init-db db-migrate
+.PHONY: help install run dev dashboard ready test lint format clean docker-build docker-run docker-stop init db-reset db-migrate
 
 help:
 	@echo "Price Tracker Makefile"
@@ -11,6 +11,7 @@ help:
 	@echo "Commands:"
 	@echo "  make install       - Install dependencies"
 	@echo "  make init          - Initialize database"
+	@echo "  make db-reset      - Drop and recreate database schema"
 	@echo "  make run           - Run the application"
 	@echo "  make dev           - Run in development mode with auto-reload"
 	@echo "  make ready         - Run deploy-time readiness checks (SERVICE=all|dashboard|main|telegram-bot)"
@@ -29,7 +30,10 @@ install:
 	playwright install
 
 init:
-	export PYTHONPATH=./src && python3 -c "from app.database.db import init_db; init_db()"
+	export PYTHONPATH=./src && python3 -m app.database.bootstrap
+
+db-reset:
+	export PYTHONPATH=./src && python3 -m app.database.bootstrap --reset
 
 run:
 	export PYTHONPATH=./src && python3 -m app.main
@@ -71,7 +75,8 @@ docker-build:
 	docker build -t price-tracker:latest .
 
 docker-run:
-	docker compose up -d
+	docker compose down --remove-orphans
+	docker compose up -d --build
 
 docker-stop:
 	docker compose down

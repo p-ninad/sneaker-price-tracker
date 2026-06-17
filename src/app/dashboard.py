@@ -23,6 +23,7 @@ from app.database.db import get_session, init_db
 from app.database.models import ScanJob, WishlistEntry
 from app.database.repository import (
     AlertRepository,
+    AuthSessionRepository,
     PriceSnapshotRepository,
     ProductRepository,
     WatchlistRepository,
@@ -851,6 +852,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if parsed_path.path == "/logout":
+            session = self._open_session()
+            try:
+                auth_result = get_authenticated_user(session, self.headers.get("Cookie"))
+                if auth_result is not None:
+                    _user, auth_session = auth_result
+                    AuthSessionRepository.revoke(session, auth_session)
+            finally:
+                session.close()
+
             secure_cookie = build_clear_session_cookie(secure=self._secure_cookie())
             self._send_redirect("/login", headers={"Set-Cookie": secure_cookie})
             return

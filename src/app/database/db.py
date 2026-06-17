@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -17,11 +19,17 @@ logger = get_logger(__name__)
 _ENGINE: Engine | None = None
 _SESSION_FACTORY: sessionmaker | None = None
 _ALEMBIC_CONFIG_PATH = Path(__file__).resolve().parents[3] / "alembic.ini"
+_POSTGRES_SCHEMA_LOCK_KEY = 814_228_917
 
 
 def _database_backend() -> str:
     """Return the configured database backend name."""
     return make_url(config.settings.database_url).drivername.split("+", 1)[0]
+
+
+def _is_postgres_backend(backend: str) -> bool:
+    """Return whether the configured backend is PostgreSQL-compatible."""
+    return backend in {"postgresql", "postgres"}
 
 
 def get_engine() -> Engine:
@@ -48,7 +56,7 @@ def get_engine() -> Engine:
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA cache_size=-64000")
             cursor.close()
-    elif backend in {"postgresql", "postgres"}:
+    elif _is_postgres_backend(backend):
         _ENGINE = create_engine(
             config.settings.database_url,
             pool_size=5,
@@ -64,6 +72,24 @@ def get_engine() -> Engine:
         )
 
     return _ENGINE
+
+
+def _run_schema_operation(
+    engine: Engine,
+    operation: Callable[[Engine | Connection], None],
+) -> None:
+    """Run schema DDL with a Postgres advisory lock when needed."""
+    backend = _database_backend()
+    if _is_postgres_backend(backend):
+        with engine.begin() as connection:
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": _POSTGRES_SCHEMA_LOCK_KEY},
+            )
+            operation(connection)
+        return
+
+    operation(engine)
 
 
 def run_migrations() -> None:
@@ -85,8 +111,20 @@ def run_migrations() -> None:
 def init_db() -> None:
     """Initialize the database schema for the configured backend."""
     engine = get_engine()
-    Base.metadata.create_all(bind=engine)
+    _run_schema_operation(engine, lambda bind: Base.metadata.create_all(bind=bind))
     logger.info("Database schema initialized", database_url=config.settings.database_url)
+
+
+def reset_db() -> None:
+    """Drop and recreate the database schema for a fresh application launch."""
+    engine = get_engine()
+
+    def reset_schema(bind: Engine | Connection) -> None:
+        Base.metadata.drop_all(bind=bind)
+        Base.metadata.create_all(bind=bind)
+
+    _run_schema_operation(engine, reset_schema)
+    logger.info("Database schema reset", database_url=config.settings.database_url)
 
 
 def get_session() -> Session:
