@@ -1,4 +1,4 @@
-"""Container database bootstrap commands."""
+"""Database bootstrap commands for local development and maintenance."""
 
 from __future__ import annotations
 
@@ -9,12 +9,16 @@ from app.utils.logger import setup_logging
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Initialize or reset the database schema."""
+    """Initialize or reset the database schema.
+
+    PostgreSQL deployments should use `python -m app.migrations upgrade head`.
+    The reset path intentionally refuses to drop persistent PostgreSQL data.
+    """
     parser = argparse.ArgumentParser(description="Bootstrap the application database")
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="Drop and recreate the schema before starting application services",
+        help="Drop and recreate the local SQLite schema",
     )
     args = parser.parse_args(argv)
 

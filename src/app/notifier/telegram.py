@@ -3,13 +3,13 @@
 import asyncio
 import html
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 from telegram import Bot
 from telegram.error import TelegramError
 
 from app.config import settings
 from app.database.models import Alert, Product
-from app.database.repository import AlertRepository
+from app.database.repository import AlertRepository, AppSettingRepository
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -43,18 +43,28 @@ class TelegramNotifier:
 
         self.bot = Bot(token=self.bot_token)
 
-    async def send_message(self, text: str, context: dict | None = None) -> bool:
+    async def send_message(
+        self,
+        text: str,
+        context: dict | None = None,
+        chat_id: str | None = None,
+    ) -> bool:
         """Send a raw Telegram message."""
+        target_chat_id = chat_id or self.chat_id
+        if not target_chat_id:
+            logger.error("telegram_send_failed", reason="missing_chat_id", context=context)
+            return False
+
         try:
             await self.bot.send_message(
-                chat_id=self.chat_id,
+                chat_id=target_chat_id,
                 text=text,
                 parse_mode="HTML",
             )
 
             logger.info(
                 "telegram_message_sent",
-                chat_id=self.chat_id,
+                chat_id=target_chat_id,
                 context=context,
             )
             return True
@@ -62,7 +72,7 @@ class TelegramNotifier:
         except TelegramError as e:
             logger.error(
                 "telegram_send_failed",
-                chat_id=self.chat_id,
+                chat_id=target_chat_id,
                 error=str(e),
                 error_type=type(e).__name__,
                 context=context,
@@ -71,7 +81,7 @@ class TelegramNotifier:
         except Exception as e:
             logger.error(
                 "telegram_unexpected_error",
-                chat_id=self.chat_id,
+                chat_id=target_chat_id,
                 error=str(e),
                 error_type=type(e).__name__,
                 context=context,
@@ -195,6 +205,40 @@ class TelegramNotifier:
                 "kind": "mismatch_alert",
                 "source_url": source_url,
                 "title": title,
+            },
+        )
+
+    async def send_brand_monitor_update(
+        self,
+        *,
+        chat_id: str,
+        monitor_title: str,
+        platform: str,
+        query: str,
+        products_found: int,
+        products_matched: int,
+        new_products: list[dict[str, object]],
+        errors: list[str] | None = None,
+    ) -> bool:
+        """Send a per-user launch monitor scan result."""
+        message = self._format_brand_monitor_update_message(
+            monitor_title=monitor_title,
+            platform=platform,
+            query=query,
+            products_found=products_found,
+            products_matched=products_matched,
+            new_products=new_products,
+            errors=errors or [],
+        )
+
+        return await self.send_message(
+            message,
+            chat_id=chat_id,
+            context={
+                "kind": "brand_monitor_update",
+                "platform": platform,
+                "query": query,
+                "new_products": len(new_products),
             },
         )
 
@@ -340,6 +384,63 @@ Type: <code>{alert_type}</code>
             f"Actual: {html.escape(actual)}"
         )
 
+    @staticmethod
+    def _format_brand_monitor_update_message(
+        *,
+        monitor_title: str,
+        platform: str,
+        query: str,
+        products_found: int,
+        products_matched: int,
+        new_products: list[dict[str, object]],
+        errors: list[str],
+    ) -> str:
+        """Format a launch monitor scan update."""
+        lines = [
+            "<b>Launch monitor update</b>",
+            f"Monitor: {html.escape(monitor_title)}",
+            f"Platform: <i>{html.escape(platform)}</i>",
+            f"Query: <code>{html.escape(query)}</code>",
+            f"Products found: {products_found}",
+            f"Products matched: {products_matched}",
+        ]
+
+        if errors:
+            lines.append("\nErrors:")
+            lines.extend(f"- {html.escape(error)}" for error in errors)
+            return "\n".join(lines)
+
+        if not new_products:
+            lines.append("\nNo new products found.")
+            return "\n".join(lines)
+
+        lines.append(f"\nNew products found: {len(new_products)}")
+        for product in new_products[:10]:
+            title = html.escape(str(product.get("title") or "Untitled product"))
+            url = html.escape(str(product.get("url") or ""))
+            price = product.get("current_price")
+            discount = product.get("discount_percentage")
+            sizes = product.get("matched_sizes") or []
+
+            details = []
+            if isinstance(price, (int, float)):
+                details.append(f"Rs {price:,.0f}")
+            if isinstance(discount, (int, float)):
+                details.append(f"{discount:g}% off")
+            if isinstance(sizes, list) and sizes:
+                details.append(f"sizes: {', '.join(html.escape(str(size)) for size in sizes)}")
+
+            detail_text = f" ({'; '.join(details)})" if details else ""
+            if url:
+                lines.append(f"- <a href=\"{url}\">{title}</a>{detail_text}")
+            else:
+                lines.append(f"- {title}{detail_text}")
+
+        if len(new_products) > 10:
+            lines.append(f"...and {len(new_products) - 10} more.")
+
+        return "\n".join(lines)
+
     def send_alert_sync(self, alert: Alert) -> bool:
         """Synchronous wrapper for sending alert.
 
@@ -361,7 +462,11 @@ Type: <code>{alert_type}</code>
 class NotificationService:
     """Service to manage notifications: get unnotified alerts and send them."""
 
-    def __init__(self, telegram_notifier: Optional[TelegramNotifier] = None):
+    def __init__(
+        self,
+        telegram_notifier: Optional[TelegramNotifier] = None,
+        telegram_enabled_checker: Callable[[], bool] | None = None,
+    ):
         """Initialize notification service.
 
         Args:
@@ -371,12 +476,43 @@ class NotificationService:
             ValueError: If Telegram config is missing and notifier not provided
         """
         self.notifier = telegram_notifier
+        self.telegram_enabled_checker = telegram_enabled_checker
         if not self.notifier:
             try:
                 self.notifier = TelegramNotifier()
             except ValueError as e:
                 logger.warning("telegram_notifier_disabled", reason=str(e))
                 self.notifier = None
+
+    def _telegram_enabled(self, session=None) -> bool:
+        """Return whether Telegram sends are currently allowed."""
+        if self.telegram_enabled_checker is not None:
+            return bool(self.telegram_enabled_checker())
+
+        if session is not None:
+            try:
+                return AppSettingRepository.telegram_connectivity_enabled(session)
+            except Exception as exc:
+                logger.warning(
+                    "telegram_connectivity_check_failed",
+                    error=str(exc),
+                )
+
+        return settings.telegram_connectivity_enabled
+
+    def _get_notifier(self, session=None) -> Optional[TelegramNotifier]:
+        """Return a notifier only when Telegram connectivity is enabled."""
+        if not self._telegram_enabled(session):
+            logger.info("telegram_connectivity_disabled")
+            return None
+
+        if self.notifier is None:
+            try:
+                self.notifier = TelegramNotifier()
+            except ValueError as exc:
+                logger.warning("telegram_notifier_disabled", reason=str(exc))
+
+        return self.notifier
 
     async def process_unnotified_alerts(
         self, session, batch_size: int = 10
@@ -390,7 +526,8 @@ class NotificationService:
         Returns:
             Dictionary with sent_count and failed_count
         """
-        if not self.notifier:
+        notifier = self._get_notifier(session)
+        if not notifier:
             logger.warning("notification_service_disabled")
             return {"sent_count": 0, "failed_count": 0, "reason": "notifier_disabled"}
 
@@ -408,7 +545,7 @@ class NotificationService:
             )
 
             # Send batch
-            result = await self.notifier.send_alerts_batch(unnotified)
+            result = await notifier.send_alerts_batch(unnotified)
 
             sent_ids = set(result.get("sent_alert_ids", []))
             if not sent_ids and result.get("failed_count", 0) == 0:
@@ -445,13 +582,15 @@ class NotificationService:
         alerts_created: int,
         mismatches: list[str] | None = None,
         errors: list[str] | None = None,
+        session=None,
     ) -> bool:
         """Send a scan summary message via Telegram when available."""
-        if not self.notifier:
+        notifier = self._get_notifier(session)
+        if not notifier:
             logger.warning("notification_service_disabled")
             return False
 
-        return await self.notifier.send_scan_summary(
+        return await notifier.send_scan_summary(
             scan_type=scan_type,
             entries_scanned=entries_scanned,
             products_updated=products_updated,
@@ -466,15 +605,47 @@ class NotificationService:
         title: str,
         expected: str,
         actual: str,
+        session=None,
     ) -> bool:
         """Send a mismatch alert via Telegram when available."""
-        if not self.notifier:
+        notifier = self._get_notifier(session)
+        if not notifier:
             logger.warning("notification_service_disabled")
             return False
 
-        return await self.notifier.send_mismatch_alert(
+        return await notifier.send_mismatch_alert(
             source_url=source_url,
             title=title,
             expected=expected,
             actual=actual,
+        )
+
+    async def send_brand_monitor_update(
+        self,
+        *,
+        chat_id: str,
+        monitor_title: str,
+        platform: str,
+        query: str,
+        products_found: int,
+        products_matched: int,
+        new_products: list[dict[str, object]],
+        errors: list[str] | None = None,
+        session=None,
+    ) -> bool:
+        """Send a brand monitor update via Telegram when available."""
+        notifier = self._get_notifier(session)
+        if not notifier:
+            logger.warning("notification_service_disabled")
+            return False
+
+        return await notifier.send_brand_monitor_update(
+            chat_id=chat_id,
+            monitor_title=monitor_title,
+            platform=platform,
+            query=query,
+            products_found=products_found,
+            products_matched=products_matched,
+            new_products=new_products,
+            errors=errors,
         )

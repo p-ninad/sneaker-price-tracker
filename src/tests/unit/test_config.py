@@ -6,7 +6,13 @@ from app.config import load_settings
 
 
 def test_load_settings_uses_explicit_env_file(tmp_path: Path, monkeypatch):
-    for key in ("ENV", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "PLAYWRIGHT_HEADLESS"):
+    for key in (
+        "ENV",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_CHAT_ID",
+        "TELEGRAM_CONNECTIVITY_ENABLED",
+        "PLAYWRIGHT_HEADLESS",
+    ):
         monkeypatch.delenv(key, raising=False)
 
     env_file = tmp_path / ".env.test"
@@ -25,12 +31,52 @@ def test_load_settings_uses_explicit_env_file(tmp_path: Path, monkeypatch):
     assert settings.playwright_headless is False
 
 
+def test_load_settings_enables_telegram_connectivity_by_default(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.delenv("TELEGRAM_CONNECTIVITY_ENABLED", raising=False)
+
+    env_file = tmp_path / ".env.test"
+    env_file.write_text("ENV=production\n")
+
+    settings = load_settings(env_file=env_file)
+
+    assert settings.telegram_connectivity_enabled is True
+
+
 def test_load_settings_rejects_partial_telegram_credentials(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_CONNECTIVITY_ENABLED", raising=False)
 
     env_file = tmp_path / ".env.test"
-    env_file.write_text("ENV=production\nTELEGRAM_BOT_TOKEN=test-token\n")
+    env_file.write_text(
+        "ENV=production\n"
+        "TELEGRAM_CONNECTIVITY_ENABLED=true\n"
+        "TELEGRAM_BOT_TOKEN=test-token\n"
+    )
 
     with pytest.raises(ValueError, match="TELEGRAM_CHAT_ID"):
         load_settings(env_file=env_file)
+
+
+def test_load_settings_allows_partial_telegram_credentials_when_disabled(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_CONNECTIVITY_ENABLED", raising=False)
+
+    env_file = tmp_path / ".env.test"
+    env_file.write_text(
+        "ENV=production\n"
+        "TELEGRAM_CHAT_ID=123456\n"
+        "TELEGRAM_CONNECTIVITY_ENABLED=false\n"
+    )
+
+    settings = load_settings(env_file=env_file)
+
+    assert settings.telegram_connectivity_enabled is False
+    assert settings.telegram_chat_id == "123456"

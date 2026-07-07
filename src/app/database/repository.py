@@ -5,9 +5,17 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, and_, or_
 from app.database.models import (
+    AppSetting,
     AuthSession,
+    BrandMonitor,
+    BrandMonitorScan,
+    BrandMonitorScanResult,
+    BrandMonitorSeenProduct,
+    ManualDiscoveryResult,
+    ManualDiscoveryScan,
     Platform,
     Product,
+    ProductIgnore,
     PriceSnapshot,
     StockSnapshot,
     Alert,
@@ -16,10 +24,13 @@ from app.database.models import (
     Watchlist,
     WishlistEntry,
 )
+import app.config as config
 from app.utils.logger import get_logger
 from app.auth.tokens import hash_token
 
 logger = get_logger(__name__)
+
+TELEGRAM_CONNECTIVITY_SETTING_KEY = "telegram_connectivity_enabled"
 
 
 class UserRepository:
@@ -322,6 +333,72 @@ class AuthSessionRepository:
         return auth_session
 
 
+class AppSettingRepository:
+    """Repository for admin-controlled application settings."""
+
+    @staticmethod
+    def get(session: Session, key: str) -> AppSetting | None:
+        """Return a setting row by key."""
+        return session.query(AppSetting).filter(AppSetting.key == key).first()
+
+    @staticmethod
+    def set_value(session: Session, key: str, value: str) -> AppSetting:
+        """Create or update a setting value."""
+        cleaned_key = key.strip()
+        if not cleaned_key:
+            raise ValueError("setting key is required")
+
+        setting = AppSettingRepository.get(session, cleaned_key)
+        if setting is None:
+            setting = AppSetting(key=cleaned_key, value=value)
+            session.add(setting)
+        else:
+            setting.value = value
+
+        session.commit()
+        return setting
+
+    @staticmethod
+    def get_bool(session: Session, key: str, default: bool = False) -> bool:
+        """Return a boolean setting value."""
+        setting = AppSettingRepository.get(session, key)
+        if setting is None:
+            return default
+
+        normalized = str(setting.value).strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    @staticmethod
+    def set_bool(session: Session, key: str, value: bool) -> AppSetting:
+        """Persist a boolean setting value."""
+        return AppSettingRepository.set_value(session, key, "true" if value else "false")
+
+    @staticmethod
+    def telegram_connectivity_enabled(session: Session) -> bool:
+        """Return whether runtime Telegram communication is enabled."""
+        return AppSettingRepository.get_bool(
+            session,
+            TELEGRAM_CONNECTIVITY_SETTING_KEY,
+            default=config.settings.telegram_connectivity_enabled,
+        )
+
+    @staticmethod
+    def set_telegram_connectivity_enabled(
+        session: Session,
+        enabled: bool,
+    ) -> AppSetting:
+        """Persist the Telegram connectivity switch."""
+        return AppSettingRepository.set_bool(
+            session,
+            TELEGRAM_CONNECTIVITY_SETTING_KEY,
+            enabled,
+        )
+
+
 class PlatformRepository:
     """Repository for Platform operations."""
 
@@ -365,6 +442,7 @@ class ProductRepository:
         title: str,
         listed_price: Optional[float] = None,
         discounted_price: Optional[float] = None,
+        discount_percentage: Optional[float] = None,
         currency: str = "INR",
         in_stock: bool = True,
         sizes_available: Optional[str] = None,
@@ -386,6 +464,7 @@ class ProductRepository:
             existing.model_name = model_name
             existing.listed_price = listed_price
             existing.discounted_price = discounted_price
+            existing.discount_percentage = discount_percentage
             existing.currency = currency
             existing.in_stock = in_stock
             existing.sizes_available = sizes_available
@@ -405,6 +484,7 @@ class ProductRepository:
                 title=title,
                 listed_price=listed_price,
                 discounted_price=discounted_price,
+                discount_percentage=discount_percentage,
                 currency=currency,
                 in_stock=in_stock,
                 sizes_available=sizes_available,
@@ -447,6 +527,499 @@ class ProductRepository:
             Product.model_name.ilike(f"%{model_name}%"),
             Product.is_active == True,
         ).all()
+
+
+class BrandMonitorRepository:
+    """Repository for user-defined launch/brand monitors."""
+
+    @staticmethod
+    def create(
+        session: Session,
+        user_id: int,
+        platform: str,
+        brand: str,
+        query_terms: str | None = None,
+        size_scope: str | None = None,
+        min_discount_percentage: float | None = None,
+        max_price: float | None = None,
+        require_in_stock: bool = True,
+        notes: str | None = None,
+    ) -> BrandMonitor:
+        """Create a brand monitor."""
+        cleaned_platform = platform.strip().lower()
+        cleaned_brand = brand.strip()
+        if not cleaned_platform:
+            raise ValueError("platform is required")
+        if not cleaned_brand:
+            raise ValueError("brand is required")
+
+        monitor = BrandMonitor(
+            user_id=user_id,
+            platform=cleaned_platform,
+            brand=cleaned_brand,
+            query_terms=query_terms,
+            size_scope=size_scope,
+            min_discount_percentage=min_discount_percentage,
+            max_price=max_price,
+            require_in_stock=require_in_stock,
+            notes=notes,
+            is_active=True,
+        )
+        session.add(monitor)
+        session.commit()
+        return monitor
+
+    @staticmethod
+    def get_by_id(session: Session, monitor_id: int) -> BrandMonitor | None:
+        """Return a monitor by ID."""
+        return session.query(BrandMonitor).filter(BrandMonitor.id == monitor_id).first()
+
+    @staticmethod
+    def get_for_user(session: Session, user_id: int, monitor_id: int) -> BrandMonitor | None:
+        """Return one monitor owned by a user."""
+        return (
+            session.query(BrandMonitor)
+            .filter(BrandMonitor.id == monitor_id, BrandMonitor.user_id == user_id)
+            .first()
+        )
+
+    @staticmethod
+    def list_active(session: Session) -> list[BrandMonitor]:
+        """Return all active monitors."""
+        return (
+            session.query(BrandMonitor)
+            .filter(BrandMonitor.is_active == True)
+            .order_by(BrandMonitor.created_at.desc())
+            .all()
+        )
+
+    @staticmethod
+    def list_for_user(session: Session, user_id: int) -> list[BrandMonitor]:
+        """Return monitors for a user."""
+        return (
+            session.query(BrandMonitor)
+            .filter(BrandMonitor.user_id == user_id)
+            .order_by(BrandMonitor.created_at.desc())
+            .all()
+        )
+
+    @staticmethod
+    def count_active_for_user(session: Session, user_id: int) -> int:
+        """Return active monitor count for a user."""
+        return (
+            session.query(BrandMonitor)
+            .filter(BrandMonitor.user_id == user_id, BrandMonitor.is_active == True)
+            .count()
+        )
+
+    @staticmethod
+    def count_active(session: Session) -> int:
+        """Return all active monitor count."""
+        return session.query(BrandMonitor).filter(BrandMonitor.is_active == True).count()
+
+    @staticmethod
+    def set_active(
+        session: Session,
+        monitor: BrandMonitor,
+        is_active: bool,
+    ) -> BrandMonitor:
+        """Enable or disable a monitor."""
+        monitor.is_active = is_active
+        session.commit()
+        return monitor
+
+    @staticmethod
+    def mark_scanned(session: Session, monitor: BrandMonitor) -> BrandMonitor:
+        """Record that a monitor has completed a scan."""
+        monitor.last_scanned_at = datetime.utcnow()
+        session.commit()
+        return monitor
+
+
+class ProductIgnoreRepository:
+    """Repository for products excluded from discovery scans."""
+
+    @staticmethod
+    def is_ignored(
+        session: Session,
+        platform_id: int,
+        platform_product_id: str,
+    ) -> bool:
+        """Return whether a platform product is actively ignored."""
+        cleaned_product_id = str(platform_product_id or "").strip()
+        if not cleaned_product_id:
+            return False
+
+        return (
+            session.query(ProductIgnore)
+            .filter(
+                ProductIgnore.platform_id == platform_id,
+                ProductIgnore.platform_product_id == cleaned_product_id,
+                ProductIgnore.is_active == True,
+            )
+            .first()
+            is not None
+        )
+
+    @staticmethod
+    def ignore_product(
+        session: Session,
+        product: Product,
+        created_by_user_id: int | None = None,
+        reason: str | None = None,
+    ) -> ProductIgnore:
+        """Create or reactivate an ignore-list entry for a product."""
+        existing = (
+            session.query(ProductIgnore)
+            .filter(
+                ProductIgnore.platform_id == product.platform_id,
+                ProductIgnore.platform_product_id == product.platform_product_id,
+            )
+            .first()
+        )
+        if existing is not None:
+            existing.product_id = product.id
+            existing.product_url = product.product_url
+            existing.reason = reason
+            existing.created_by_user_id = created_by_user_id
+            existing.is_active = True
+            session.commit()
+            return existing
+
+        ignored = ProductIgnore(
+            platform_id=product.platform_id,
+            product_id=product.id,
+            platform_product_id=product.platform_product_id,
+            product_url=product.product_url,
+            reason=reason,
+            created_by_user_id=created_by_user_id,
+            is_active=True,
+        )
+        session.add(ignored)
+        session.commit()
+        return ignored
+
+
+class ManualDiscoveryScanRepository:
+    """Repository for admin-triggered discovery scans."""
+
+    @staticmethod
+    def create(
+        session: Session,
+        *,
+        user_id: int,
+        platform: str,
+        brand_filters: str,
+        size_filters: str,
+    ) -> ManualDiscoveryScan:
+        """Create a running manual discovery scan."""
+        scan = ManualDiscoveryScan(
+            user_id=user_id,
+            platform=platform.strip().lower(),
+            brand_filters=brand_filters,
+            size_filters=size_filters,
+            status="running",
+        )
+        session.add(scan)
+        session.commit()
+        return scan
+
+    @staticmethod
+    def get(session: Session, scan_id: int) -> ManualDiscoveryScan | None:
+        """Return a manual discovery scan."""
+        return (
+            session.query(ManualDiscoveryScan)
+            .filter(ManualDiscoveryScan.id == scan_id)
+            .first()
+        )
+
+    @staticmethod
+    def mark_complete(
+        session: Session,
+        scan: ManualDiscoveryScan,
+        *,
+        status: str,
+        products_found: int = 0,
+        products_matched: int = 0,
+        errors: str | None = None,
+    ) -> ManualDiscoveryScan:
+        """Mark a manual discovery scan complete."""
+        scan.status = status
+        scan.products_found = products_found
+        scan.products_matched = products_matched
+        scan.errors = errors
+        scan.completed_at = datetime.utcnow()
+        session.commit()
+        return scan
+
+    @staticmethod
+    def list_recent_for_user(
+        session: Session,
+        user_id: int,
+        limit: int = 5,
+    ) -> list[ManualDiscoveryScan]:
+        """Return recent manual scans for a user."""
+        return (
+            session.query(ManualDiscoveryScan)
+            .filter(ManualDiscoveryScan.user_id == user_id)
+            .order_by(ManualDiscoveryScan.started_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+
+class ManualDiscoveryResultRepository:
+    """Repository for products matched during manual discovery scans."""
+
+    @staticmethod
+    def create(
+        session: Session,
+        *,
+        scan_id: int,
+        product_id: int,
+        matched_brand: str,
+        matched_sizes: str | None = None,
+        current_price: float | None = None,
+        discount_percentage: float | None = None,
+    ) -> ManualDiscoveryResult:
+        """Create or refresh one manual discovery result."""
+        existing = (
+            session.query(ManualDiscoveryResult)
+            .filter(
+                ManualDiscoveryResult.scan_id == scan_id,
+                ManualDiscoveryResult.product_id == product_id,
+            )
+            .first()
+        )
+        if existing is not None:
+            existing.matched_brand = matched_brand
+            existing.matched_sizes = matched_sizes
+            existing.current_price = current_price
+            existing.discount_percentage = discount_percentage
+            session.commit()
+            return existing
+
+        result = ManualDiscoveryResult(
+            scan_id=scan_id,
+            product_id=product_id,
+            matched_brand=matched_brand,
+            matched_sizes=matched_sizes,
+            current_price=current_price,
+            discount_percentage=discount_percentage,
+        )
+        session.add(result)
+        session.commit()
+        return result
+
+    @staticmethod
+    def get(session: Session, result_id: int) -> ManualDiscoveryResult | None:
+        """Return a manual discovery result."""
+        return (
+            session.query(ManualDiscoveryResult)
+            .filter(ManualDiscoveryResult.id == result_id)
+            .first()
+        )
+
+    @staticmethod
+    def list_for_scan(
+        session: Session,
+        scan_id: int,
+        *,
+        page: int = 1,
+        page_size: int = 12,
+        include_ignored: bool = False,
+    ) -> tuple[list[ManualDiscoveryResult], int]:
+        """Return one page of manual discovery results and the total count."""
+        query = session.query(ManualDiscoveryResult).filter(
+            ManualDiscoveryResult.scan_id == scan_id
+        )
+        if not include_ignored:
+            query = query.filter(ManualDiscoveryResult.is_ignored == False)
+
+        total = query.count()
+        safe_page = max(page, 1)
+        safe_page_size = max(min(page_size, 100), 1)
+        results = (
+            query.order_by(ManualDiscoveryResult.created_at.desc(), ManualDiscoveryResult.id.desc())
+            .offset((safe_page - 1) * safe_page_size)
+            .limit(safe_page_size)
+            .all()
+        )
+        return results, total
+
+    @staticmethod
+    def set_tracked(
+        session: Session,
+        result: ManualDiscoveryResult,
+        tracked: bool = True,
+    ) -> ManualDiscoveryResult:
+        """Mark a manual discovery result as tracked."""
+        result.is_tracked = tracked
+        session.commit()
+        return result
+
+    @staticmethod
+    def set_ignored(
+        session: Session,
+        result: ManualDiscoveryResult,
+        ignored: bool = True,
+    ) -> ManualDiscoveryResult:
+        """Mark a manual discovery result as ignored in its scan."""
+        result.is_ignored = ignored
+        session.commit()
+        return result
+
+
+class BrandMonitorScanRepository:
+    """Repository for brand monitor scan runs."""
+
+    @staticmethod
+    def create(
+        session: Session,
+        monitor_id: int,
+        query: str,
+        scan_job_id: int | None = None,
+    ) -> BrandMonitorScan:
+        """Create a running monitor scan."""
+        scan = BrandMonitorScan(
+            monitor_id=monitor_id,
+            scan_job_id=scan_job_id,
+            query=query,
+            status="running",
+        )
+        session.add(scan)
+        session.commit()
+        return scan
+
+    @staticmethod
+    def mark_complete(
+        session: Session,
+        scan: BrandMonitorScan,
+        status: str,
+        products_found: int = 0,
+        products_matched: int = 0,
+        new_products: int = 0,
+        errors: str | None = None,
+    ) -> BrandMonitorScan:
+        """Mark a monitor scan complete."""
+        scan.status = status
+        scan.products_found = products_found
+        scan.products_matched = products_matched
+        scan.new_products = new_products
+        scan.errors = errors
+        scan.completed_at = datetime.utcnow()
+        session.commit()
+        return scan
+
+    @staticmethod
+    def list_recent(session: Session, limit: int = 10) -> list[BrandMonitorScan]:
+        """Return recent monitor scans."""
+        return (
+            session.query(BrandMonitorScan)
+            .order_by(BrandMonitorScan.started_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+
+class BrandMonitorSeenProductRepository:
+    """Repository for monitor seen-product ledger rows."""
+
+    @staticmethod
+    def get(
+        session: Session,
+        monitor_id: int,
+        product_id: int,
+    ) -> BrandMonitorSeenProduct | None:
+        """Return a seen-product row if present."""
+        return (
+            session.query(BrandMonitorSeenProduct)
+            .filter(
+                BrandMonitorSeenProduct.monitor_id == monitor_id,
+                BrandMonitorSeenProduct.product_id == product_id,
+            )
+            .first()
+        )
+
+    @staticmethod
+    def upsert(
+        session: Session,
+        monitor_id: int,
+        product_id: int,
+        scan_id: int,
+    ) -> tuple[BrandMonitorSeenProduct, bool]:
+        """Create or refresh a seen-product row.
+
+        Returns the row and whether it was newly created.
+        """
+        seen = BrandMonitorSeenProductRepository.get(session, monitor_id, product_id)
+        if seen is not None:
+            seen.last_scan_id = scan_id
+            seen.last_seen_at = datetime.utcnow()
+            session.commit()
+            return seen, False
+
+        seen = BrandMonitorSeenProduct(
+            monitor_id=monitor_id,
+            product_id=product_id,
+            first_scan_id=scan_id,
+            last_scan_id=scan_id,
+        )
+        session.add(seen)
+        session.commit()
+        return seen, True
+
+
+class BrandMonitorScanResultRepository:
+    """Repository for per-scan monitor product matches."""
+
+    @staticmethod
+    def create(
+        session: Session,
+        scan_id: int,
+        monitor_id: int,
+        product_id: int,
+        is_new: bool,
+        matched_sizes: str | None = None,
+        current_price: float | None = None,
+        discount_percentage: float | None = None,
+    ) -> BrandMonitorScanResult:
+        """Record one matched product for a monitor scan."""
+        result = BrandMonitorScanResult(
+            scan_id=scan_id,
+            monitor_id=monitor_id,
+            product_id=product_id,
+            is_new=is_new,
+            matched_sizes=matched_sizes,
+            current_price=current_price,
+            discount_percentage=discount_percentage,
+        )
+        session.add(result)
+        session.commit()
+        return result
+
+    @staticmethod
+    def list_recent(
+        session: Session,
+        limit: int = 20,
+        user_id: int | None = None,
+        new_only: bool = False,
+    ) -> list[BrandMonitorScanResult]:
+        """Return recent monitor scan result rows."""
+        query = session.query(BrandMonitorScanResult).join(
+            BrandMonitor,
+            BrandMonitorScanResult.monitor_id == BrandMonitor.id,
+        )
+        if user_id is not None:
+            query = query.filter(BrandMonitor.user_id == user_id)
+        if new_only:
+            query = query.filter(BrandMonitorScanResult.is_new == True)
+
+        return (
+            query.order_by(BrandMonitorScanResult.created_at.desc())
+            .limit(limit)
+            .all()
+        )
 
 
 class PriceSnapshotRepository:

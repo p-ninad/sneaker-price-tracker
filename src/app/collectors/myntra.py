@@ -816,7 +816,7 @@ class MyntraCollector(BaseCollector):
                 image_url = img_element.get("src") or img_element.get("data-src")
 
             product = ProductData(
-                platform_product_id=url.split("/")[-1],
+                platform_product_id=extract_product_id_from_url(url) or url.split("/")[-1],
                 product_url=url,
                 title=title,
                 brand=brand,

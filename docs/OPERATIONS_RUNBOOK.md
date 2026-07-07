@@ -96,11 +96,13 @@ Notes:
 
 The current `docker-compose.yml` includes:
 
-- `postgres`
+- `database-migrate` as a one-shot Alembic migration gate
 - `price-tracker`
 - `dashboard`
 - `telegram-bot`
 - `caddy`
+
+PostgreSQL itself runs as a host service outside Compose. Follow `docs/EXTERNAL_POSTGRES.md` before starting the stack for the first time.
 
 ### Minimal deployment flow
 
@@ -114,6 +116,9 @@ cp .env.example .env
 
 ```env
 POSTGRES_PASSWORD=...
+POSTGRES_HOST=host.docker.internal
+POSTGRES_PORT=5432
+DOCKER_SUBNET=172.30.0.0/24
 OPENAI_API_KEY=...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
@@ -128,10 +133,10 @@ make docker-build
 make docker-run
 ```
 
-4. Apply database migrations for the Postgres stack:
+4. If you need to rerun migrations without recreating the app services:
 
 ```bash
-docker compose exec price-tracker python -m app.migrations upgrade head
+make docker-migrate
 ```
 
 5. Verify service status:
@@ -148,7 +153,7 @@ docker compose exec price-tracker python -m app.readiness --service all
 - `dashboard` is only exposed internally and is proxied by Caddy.
 - `telegram-bot` uses polling and only needs outbound access to Telegram.
 - `TELEGRAM_REQUIRE_CHAT_ID=false` is set for the standalone bot container because it only needs the bot token.
-- The Postgres volume is named `pgdata`.
+- `docker compose down` no longer deletes database data. PostgreSQL is managed by the host service.
 
 ### Choosing between local and Docker
 
@@ -203,7 +208,7 @@ In this workspace, the existing SQLite file in `data/` was not writable from the
 
 - a writable `data/` directory, or
 - a temp SQLite path, or
-- Postgres through Docker
+- host PostgreSQL
 
 ## 4) Deploy on a VPS
 
@@ -211,13 +216,14 @@ In this workspace, the existing SQLite file in `data/` was not writable from the
 
 Use Docker Compose on an Ubuntu VPS:
 
-- `postgres` for the database
+- host PostgreSQL for the database
+- `database-migrate` for one-shot schema migrations
 - `price-tracker` for collectors and scheduler
 - `dashboard` for the admin portal
 - `telegram-bot` for user chat flows
 - `caddy` for HTTPS and reverse proxying
 
-This matches the current compose file and keeps the public surface area small.
+This matches the current compose file and keeps the public surface area small while leaving the database inspectable with pgAdmin or `psql`.
 
 ### Provision the VPS
 
@@ -322,7 +328,7 @@ docker compose up -d --build
 ### Run database migrations
 
 ```bash
-docker compose exec price-tracker python -m app.migrations upgrade head
+make docker-migrate
 ```
 
 ### Verify readiness
@@ -358,11 +364,11 @@ https://tracker.example.com/login
 - Confirm the dashboard accepts admin login and rejects regular users.
 - Confirm the bot process is healthy and polling.
 - Confirm `make ready` / readiness passes for the relevant services.
-- Confirm Postgres data is on the `pgdata` volume or an equivalent backup-backed location.
+- Confirm PostgreSQL data lives under the host Postgres data directory or an equivalent backup-backed location.
 
 ### Backup reminder
 
-Back up the `pgdata` volume regularly. A simple operational backup is a `pg_dump` run from the Postgres container or a snapshot from your VPS provider.
+Back up the host PostgreSQL database regularly. A simple operational backup is a `pg_dump` or a snapshot from your VPS provider.
 
 ## 5) Communicate with the bot through Telegram
 
@@ -429,7 +435,7 @@ The bot startup calls Telegram over the network during initialization. If the VP
 - The dashboard is admin-only.
 - Regular users are Telegram-only.
 - The scheduler and the bot are separate processes.
-- The app currently uses Postgres in Docker and SQLite locally by default.
+- The app currently uses host PostgreSQL for Docker deployments and SQLite locally by default.
 - `make dev` does not yet add live reload.
 - `make ready` is a good preflight before exposing the VPS.
 - If you are validating a deployment, check the logs and the readiness output before asking other people to test it.
@@ -450,7 +456,7 @@ make run
 ```bash
 make docker-build
 make docker-run
-docker compose exec price-tracker python -m app.migrations upgrade head
+make docker-migrate
 docker compose exec price-tracker python -m app.readiness --service all
 ```
 
@@ -464,6 +470,6 @@ PYTHONPATH=./src ./.venv/bin/python -m pytest src/tests -v
 
 ```bash
 docker compose up -d --build
-docker compose exec price-tracker python -m app.migrations upgrade head
+make docker-migrate
 docker compose exec price-tracker python -m app.readiness --service all
 ```

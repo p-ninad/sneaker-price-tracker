@@ -235,6 +235,33 @@ class TestTelegramNotifier:
         assert "New Balance 574" in message
         assert "new balance 990" in message
 
+    @pytest.mark.asyncio
+    async def test_send_brand_monitor_update_to_user_chat(self):
+        """Test sending launch monitor updates to an explicit chat."""
+        notifier = TelegramNotifier(
+            bot_token="test_token",
+            chat_id="default_chat",
+        )
+
+        notifier.bot = AsyncMock()
+        notifier.bot.send_message = AsyncMock()
+
+        result = await notifier.send_brand_monitor_update(
+            chat_id="user_chat",
+            monitor_title="Adidas Originals on myntra",
+            platform="myntra",
+            query="Adidas Originals sneakers",
+            products_found=12,
+            products_matched=2,
+            new_products=[],
+        )
+
+        assert result is True
+        notifier.bot.send_message.assert_called_once()
+        call_args = notifier.bot.send_message.call_args
+        assert call_args.kwargs["chat_id"] == "user_chat"
+        assert "No new products found" in call_args.kwargs["text"]
+
     def test_format_alert_message_price_drop(self, mock_alert, mock_product):
         """Test message formatting for price drop alert."""
         mock_product.last_price_check_at = datetime.utcnow() - timedelta(minutes=15)
@@ -364,7 +391,10 @@ class TestNotificationService:
     def test_init_with_notifier(self):
         """Test initialization with provided notifier."""
         mock_notifier = MagicMock(spec=TelegramNotifier)
-        service = NotificationService(telegram_notifier=mock_notifier)
+        service = NotificationService(
+            telegram_notifier=mock_notifier,
+            telegram_enabled_checker=lambda: True,
+        )
         
         assert service.notifier == mock_notifier
 
@@ -395,7 +425,10 @@ class TestNotificationService:
             return_value={"sent_count": 1, "failed_count": 0}
         )
         
-        service = NotificationService(telegram_notifier=mock_notifier)
+        service = NotificationService(
+            telegram_notifier=mock_notifier,
+            telegram_enabled_checker=lambda: True,
+        )
         
         # Mock the repository
         with patch("app.notifier.telegram.AlertRepository") as MockRepo:
@@ -414,7 +447,10 @@ class TestNotificationService:
     async def test_process_unnotified_alerts_none(self):
         """Test processing when no alerts exist."""
         mock_notifier = AsyncMock(spec=TelegramNotifier)
-        service = NotificationService(telegram_notifier=mock_notifier)
+        service = NotificationService(
+            telegram_notifier=mock_notifier,
+            telegram_enabled_checker=lambda: True,
+        )
         
         with patch("app.notifier.telegram.AlertRepository") as MockRepo:
             MockRepo.get_unnotified.return_value = []
@@ -440,10 +476,32 @@ class TestNotificationService:
             assert "reason" in result
 
     @pytest.mark.asyncio
+    async def test_send_scan_summary_skips_when_connectivity_disabled(self):
+        """Test Telegram sends are skipped when the admin switch is off."""
+        mock_notifier = AsyncMock(spec=TelegramNotifier)
+        service = NotificationService(
+            telegram_notifier=mock_notifier,
+            telegram_enabled_checker=lambda: False,
+        )
+
+        result = await service.send_scan_summary(
+            scan_type="watchlist",
+            entries_scanned=1,
+            products_updated=1,
+            alerts_created=0,
+        )
+
+        assert result is False
+        mock_notifier.send_scan_summary.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_process_unnotified_alerts_error(self):
         """Test error handling in process_unnotified_alerts."""
         mock_notifier = AsyncMock(spec=TelegramNotifier)
-        service = NotificationService(telegram_notifier=mock_notifier)
+        service = NotificationService(
+            telegram_notifier=mock_notifier,
+            telegram_enabled_checker=lambda: True,
+        )
         
         with patch("app.notifier.telegram.AlertRepository") as MockRepo:
             MockRepo.get_unnotified.side_effect = Exception("DB error")
@@ -463,7 +521,10 @@ class TestNotificationService:
             return_value={"sent_count": 1, "failed_count": 0}
         )
         
-        service = NotificationService(telegram_notifier=mock_notifier)
+        service = NotificationService(
+            telegram_notifier=mock_notifier,
+            telegram_enabled_checker=lambda: True,
+        )
         
         with patch("app.notifier.telegram.AlertRepository") as MockRepo:
             MockRepo.get_unnotified.return_value = [mock_alert]

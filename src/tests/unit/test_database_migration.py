@@ -9,13 +9,14 @@ class _FakeConnection:
         self.calls.append(("execute", str(statement), params))
 
 
-class _FakeBegin:
-    def __init__(self, calls: list[tuple]) -> None:
+class _FakeContext:
+    def __init__(self, calls: list[tuple], enter_label: str) -> None:
         self.calls = calls
+        self.enter_label = enter_label
         self.connection = _FakeConnection(calls)
 
     def __enter__(self):
-        self.calls.append(("begin",))
+        self.calls.append((self.enter_label,))
         return self.connection
 
     def __exit__(self, exc_type, exc, traceback):
@@ -26,13 +27,17 @@ class _FakeBegin:
 class _FakeEngine:
     def __init__(self, calls: list[tuple]) -> None:
         self.calls = calls
-        self.context = _FakeBegin(calls)
+        self.begin_context = _FakeContext(calls, "begin")
+        self.connect_context = _FakeContext(calls, "connect")
 
     def begin(self):
-        return self.context
+        return self.begin_context
+
+    def connect(self):
+        return self.connect_context
 
 
-def test_init_db_uses_postgres_schema_lock(monkeypatch):
+def test_init_db_verifies_postgres_connection_without_creating_schema(monkeypatch):
     import app.database.db as db
 
     calls: list[tuple] = []
@@ -48,12 +53,11 @@ def test_init_db_uses_postgres_schema_lock(monkeypatch):
 
     db.init_db()
 
-    assert calls[0] == ("begin",)
-    assert calls[1][0] == "execute"
-    assert "pg_advisory_xact_lock" in calls[1][1]
-    assert calls[1][2] == {"lock_key": db._POSTGRES_SCHEMA_LOCK_KEY}
-    assert calls[2] == ("create_all", engine.context.connection)
-    assert calls[3] == ("end", None)
+    assert calls == [
+        ("connect",),
+        ("execute", "SELECT 1", None),
+        ("end", None),
+    ]
 
 
 def test_init_db_creates_schema_directly_for_sqlite(monkeypatch):
@@ -100,3 +104,15 @@ def test_reset_db_drops_and_recreates_schema(monkeypatch):
         ("drop_all", engine),
         ("create_all", engine),
     ]
+
+
+def test_reset_db_rejects_postgres(monkeypatch):
+    import pytest
+
+    import app.database.db as db
+
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+    monkeypatch.setattr(db, "_database_backend", lambda: "postgresql")
+
+    with pytest.raises(RuntimeError, match="disabled for PostgreSQL"):
+        db.reset_db()

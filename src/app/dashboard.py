@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -23,12 +25,21 @@ from app.database.db import get_session, init_db
 from app.database.models import ScanJob, WishlistEntry
 from app.database.repository import (
     AlertRepository,
+    AppSettingRepository,
+    BrandMonitorRepository,
+    BrandMonitorScanRepository,
+    BrandMonitorScanResultRepository,
     AuthSessionRepository,
+    ManualDiscoveryResultRepository,
+    ManualDiscoveryScanRepository,
     PriceSnapshotRepository,
     ProductRepository,
+    ProductIgnoreRepository,
     WatchlistRepository,
     UserRepository,
 )
+from app.services.brand_monitor import BrandMonitorService
+from app.services.manual_discovery import ManualDiscoveryService
 from app.services.wishlist import WishlistService
 from app.utils.logger import get_logger
 
@@ -188,13 +199,150 @@ def parse_csv(value: str | None) -> list[str] | None:
     return parsed or None
 
 
+def parse_json_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+    if not isinstance(parsed, list):
+        return []
+
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
+def parse_optional_float(value: str | None) -> float | None:
+    cleaned = (value or "").strip().replace(",", "")
+    if not cleaned:
+        return None
+    return float(cleaned)
+
+
+def format_datetime(value) -> str:
+    if value is None:
+        return "Never"
+    return str(value).split(".", 1)[0]
+
+
+def build_telegram_connectivity_summary(session) -> dict[str, object]:
+    enabled = AppSettingRepository.telegram_connectivity_enabled(session)
+    token_configured = bool(config.settings.telegram_bot_token)
+    default_chat_configured = bool(config.settings.telegram_chat_id)
+
+    return {
+        "enabled": enabled,
+        "token_configured": token_configured,
+        "default_chat_configured": default_chat_configured,
+        "status_label": "enabled" if enabled else "disabled",
+    }
+
+
+def build_monitor_result_views(
+    session,
+    selected_user_id: int | None = None,
+    limit: int = 20,
+) -> list[dict[str, object]]:
+    results = BrandMonitorScanResultRepository.list_recent(
+        session,
+        limit=limit,
+        user_id=selected_user_id,
+    )
+    views: list[dict[str, object]] = []
+    for result in results:
+        monitor = result.monitor
+        product = result.product
+        scan = result.scan
+        owner = monitor.owner if monitor is not None else None
+        views.append(
+            {
+                "result": result,
+                "monitor": monitor,
+                "product": product,
+                "scan": scan,
+                "user_label": (
+                    owner.display_name or owner.username
+                    if owner is not None
+                    else "Unknown user"
+                ),
+                "monitor_label": (
+                    BrandMonitorService.describe_monitor(monitor)
+                    if monitor is not None
+                    else "Unknown monitor"
+                ),
+                "matched_sizes": parse_json_list(result.matched_sizes),
+            }
+        )
+    return views
+
+
+def build_manual_result_payload(result) -> dict[str, object]:
+    """Return a JSON-safe representation of a manual scan result."""
+    product = result.product
+    platform = product.platform if product is not None else None
+    return {
+        "id": result.id,
+        "product_id": result.product_id,
+        "title": product.title if product is not None else "Unknown product",
+        "brand": product.brand if product is not None else "",
+        "model_name": product.model_name if product is not None else "",
+        "product_url": product.product_url if product is not None else "",
+        "image_url": product.image_url if product is not None else "",
+        "platform": platform.display_name if platform is not None else "",
+        "matched_brand": result.matched_brand,
+        "matched_sizes": parse_json_list(result.matched_sizes),
+        "current_price": result.current_price,
+        "currency": product.currency if product is not None else "INR",
+        "discount_percentage": result.discount_percentage,
+        "is_tracked": result.is_tracked,
+        "is_ignored": result.is_ignored,
+    }
+
+
+def build_manual_scan_payload(
+    session,
+    scan_id: int,
+    *,
+    page: int = 1,
+    page_size: int = 12,
+) -> dict[str, object] | None:
+    """Return scan status plus one page of visible manual discovery results."""
+    scan = ManualDiscoveryScanRepository.get(session, scan_id)
+    if scan is None:
+        return None
+
+    results, total = ManualDiscoveryResultRepository.list_for_scan(
+        session,
+        scan.id,
+        page=page,
+        page_size=page_size,
+    )
+    total_pages = max(1, math.ceil(total / page_size)) if total else 1
+    return {
+        "scan_id": scan.id,
+        "status": scan.status,
+        "products_found": scan.products_found or 0,
+        "products_matched": scan.products_matched or 0,
+        "errors": parse_json_list(scan.errors),
+        "page": max(page, 1),
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+        "results": [build_manual_result_payload(result) for result in results],
+    }
+
+
 def build_summary(session, selected_user_id: int | None = None, user_search_query: str | None = None) -> dict:
     selected_user = None
     entries = []
+    monitors = []
     if selected_user_id is not None:
         selected_user = UserRepository.get_by_id(session, selected_user_id)
         if selected_user is not None:
             entries = WishlistService.get_all_for_user(session, selected_user.id)
+            monitors = BrandMonitorRepository.list_for_user(session, selected_user.id)
 
     user_search_results = UserRepository.search_telegram_users(session, user_search_query)
     pending_alerts = AlertRepository.get_unnotified(session, limit=100)
@@ -205,11 +353,27 @@ def build_summary(session, selected_user_id: int | None = None, user_search_quer
         .all()
     )
     trends = build_dashboard_trends(session, entries) if selected_user is not None else []
+    recent_monitor_scans = BrandMonitorScanRepository.list_recent(session, limit=5)
+    monitor_results = build_monitor_result_views(
+        session,
+        selected_user_id=selected_user.id if selected_user is not None else None,
+    )
+    recent_manual_scans = (
+        ManualDiscoveryScanRepository.list_recent_for_user(session, selected_user.id, limit=5)
+        if selected_user is not None
+        else []
+    )
 
     return {
         "entries": entries,
+        "monitors": monitors,
         "pending_alerts": len(pending_alerts),
         "recent_scans": recent_scans,
+        "recent_monitor_scans": recent_monitor_scans,
+        "recent_manual_scans": recent_manual_scans,
+        "monitor_results": monitor_results,
+        "active_monitor_count": BrandMonitorRepository.count_active(session),
+        "telegram_connectivity": build_telegram_connectivity_summary(session),
         "trends": trends,
         "selected_user": selected_user,
         "user_search_query": user_search_query or "",
@@ -307,6 +471,11 @@ def render_dashboard_template(
     entries = summary["entries"]
     pending_alerts = summary["pending_alerts"]
     recent_scans = summary["recent_scans"]
+    recent_monitor_scans = summary["recent_monitor_scans"]
+    recent_manual_scans = summary["recent_manual_scans"]
+    monitors = summary["monitors"]
+    monitor_results = summary["monitor_results"]
+    telegram_connectivity = summary["telegram_connectivity"]
     trends = summary["trends"]
     trend_lookup = {
         trend["entry"].id: trend["trend_url"]
@@ -370,6 +539,91 @@ def render_dashboard_template(
             f"<li>{scan.scan_type} | {scan.status} | {scan.products_found} products | {scan.products_updated} updated</li>"
         )
 
+    monitor_scan_rows = []
+    for scan in recent_monitor_scans:
+        monitor = scan.monitor
+        monitor_label = (
+            BrandMonitorService.describe_monitor(monitor)
+            if monitor is not None
+            else f"Monitor #{scan.monitor_id}"
+        )
+        monitor_scan_rows.append(
+            "<li>"
+            f"{html.escape(monitor_label)} | {html.escape(scan.status)} | "
+            f"{scan.products_found} found | {scan.products_matched} matched | "
+            f"{scan.new_products} new | {html.escape(format_datetime(scan.completed_at or scan.started_at))}"
+            "</li>"
+        )
+
+    manual_scan_rows = []
+    for scan in recent_manual_scans:
+        brands = ", ".join(parse_json_list(scan.brand_filters))
+        sizes = ", ".join(parse_json_list(scan.size_filters))
+        manual_scan_rows.append(
+            "<li>"
+            f"#{scan.id} | {html.escape(scan.status)} | "
+            f"{html.escape(brands)} | sizes {html.escape(sizes)} | "
+            f"{scan.products_matched} matched | "
+            f"{html.escape(format_datetime(scan.completed_at or scan.started_at))}"
+            "</li>"
+        )
+
+    monitor_rows = []
+    for monitor in monitors:
+        status = "active" if monitor.is_active else "paused"
+        monitor_rows.append(
+            f"""
+            <tr>
+              <td>{html.escape(str(monitor.id))}</td>
+              <td>{html.escape(monitor.platform)}</td>
+              <td>{html.escape(monitor.brand)}</td>
+              <td>{html.escape(', '.join(BrandMonitorService.get_query_terms(monitor)))}</td>
+              <td>{html.escape(', '.join(BrandMonitorService.get_size_scope(monitor)))}</td>
+              <td>{html.escape(str(monitor.min_discount_percentage or ''))}</td>
+              <td>{html.escape(format_currency(monitor.max_price)) if monitor.max_price is not None else ''}</td>
+              <td>{html.escape(status)}</td>
+              <td>{html.escape(format_datetime(monitor.last_scanned_at))}</td>
+              <td>
+                <form method="post" style="display:inline">
+                  <input type="hidden" name="action" value="toggle_monitor">
+                  <input type="hidden" name="user_id" value="{html.escape(str(monitor.user_id))}">
+                  <input type="hidden" name="monitor_id" value="{html.escape(str(monitor.id))}">
+                  <input type="hidden" name="enabled" value="{ 'false' if monitor.is_active else 'true' }">
+                  <button type="submit">{ 'Pause' if monitor.is_active else 'Resume' }</button>
+                </form>
+                <form method="post" style="display:inline">
+                  <input type="hidden" name="action" value="delete_monitor">
+                  <input type="hidden" name="user_id" value="{html.escape(str(monitor.user_id))}">
+                  <input type="hidden" name="monitor_id" value="{html.escape(str(monitor.id))}">
+                  <button type="submit">Delete</button>
+                </form>
+              </td>
+            </tr>
+            """
+        )
+
+    monitor_result_rows = []
+    for view in monitor_results:
+        product = view["product"]
+        result = view["result"]
+        scan = view["scan"]
+        monitor_result_rows.append(
+            f"""
+            <tr>
+              <td>{html.escape(str(view["user_label"]))}</td>
+              <td>{html.escape(str(view["monitor_label"]))}</td>
+              <td><a href="{html.escape(product.product_url)}" target="_blank" rel="noreferrer">{html.escape(product.title)}</a></td>
+              <td>{html.escape(product.platform.display_name if product.platform else '')}</td>
+              <td>{html.escape(', '.join(view["matched_sizes"]))}</td>
+              <td>{html.escape(format_currency(result.current_price, product.currency))}</td>
+              <td>{'' if result.discount_percentage is None else html.escape(f'{result.discount_percentage:g}%')}</td>
+              <td>{'Yes' if result.is_new else 'No'}</td>
+              <td>{html.escape(scan.status if scan is not None else '')}</td>
+              <td>{html.escape(format_datetime(result.created_at))}</td>
+            </tr>
+            """
+        )
+
     trend_cards = []
     for trend in trends:
         entry = trend["entry"]
@@ -416,6 +670,10 @@ def render_dashboard_template(
 
     flash_block = f'<div class="flash">{html.escape(flash)}</div>' if flash else ""
     display_name = user.display_name or user.username
+    telegram_enabled = bool(telegram_connectivity["enabled"])
+    telegram_toggle_label = "Enabled" if telegram_enabled else "Disabled"
+    telegram_next_value = "false" if telegram_enabled else "true"
+    telegram_next_label = "Disable Telegram" if telegram_enabled else "Enable Telegram"
     user_result_rows = []
     for candidate in user_search_results:
         user_result_rows.append(
@@ -465,6 +723,24 @@ def render_dashboard_template(
     .down {{ color: #166534; }}
     .neutral {{ color: #6b7280; }}
     .chart {{ margin-top: 0.75rem; }}
+    .toggle-form {{ display: flex; align-items: center; gap: 0.75rem; margin-top: 0.75rem; }}
+    .toggle-input {{ width: auto; margin: 0; }}
+    .status-pill {{ display: inline-block; padding: 0.2rem 0.55rem; border-radius: 999px; font-size: 0.85rem; font-weight: 700; }}
+    .status-on {{ background: #dcfce7; color: #166534; }}
+    .status-off {{ background: #fee2e2; color: #991b1b; }}
+    .inline-fields {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; }}
+    .manual-scan-status {{ margin-top: 1rem; padding: 0.75rem; border: 1px solid #d1d5db; border-radius: 8px; background: #fff; }}
+    .product-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-top: 1rem; }}
+    .product-card {{ background: #fff; border: 1px solid #d1d5db; border-radius: 8px; padding: 0.85rem; display: flex; flex-direction: column; gap: 0.6rem; }}
+    .product-thumb {{ width: 100%; aspect-ratio: 4 / 3; object-fit: cover; border-radius: 6px; background: #e5e7eb; }}
+    .product-title {{ color: #111827; font-weight: 700; text-decoration: none; }}
+    .product-meta {{ color: #4b5563; font-size: 0.9rem; line-height: 1.35; }}
+    .product-actions {{ display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: auto; }}
+    .product-actions button {{ margin-top: 0; flex: 1 1 90px; }}
+    button.danger {{ background: #b91c1c; }}
+    button:disabled {{ opacity: 0.6; cursor: not-allowed; }}
+    .pager {{ display: flex; align-items: center; gap: 0.75rem; margin-top: 1rem; }}
+    .pager button {{ margin-top: 0; }}
   </style>
 </head>
 <body>
@@ -508,13 +784,121 @@ def render_dashboard_template(
       <h2>Operational summary</h2>
       <p><strong>Wishlist entries:</strong> {len(entries)}</p>
       <p><strong>Pending alerts:</strong> {pending_alerts}</p>
+      <p><strong>Active discovery monitors:</strong> {summary["active_monitor_count"]}</p>
+      <p>
+        <strong>Telegram connectivity:</strong>
+        <span class="status-pill {'status-on' if telegram_enabled else 'status-off'}">{html.escape(telegram_toggle_label)}</span>
+      </p>
+      <form method="post" class="toggle-form">
+        <input type="hidden" name="action" value="telegram_connectivity">
+        <input type="hidden" name="user_id" value="{html.escape(str(selected_user_id_value))}">
+        <input type="hidden" name="enabled" value="{html.escape(telegram_next_value)}">
+        <input
+          class="toggle-input"
+          type="checkbox"
+          aria-label="Telegram connectivity"
+          {'checked' if telegram_enabled else ''}
+          onchange="this.form.submit()"
+        >
+        <button type="submit">{html.escape(telegram_next_label)}</button>
+      </form>
+      <p class="hint">Bot token: {'configured' if telegram_connectivity["token_configured"] else 'missing'} | Default chat: {'configured' if telegram_connectivity["default_chat_configured"] else 'not configured'}</p>
       {selected_user_hint}
       <h3>Recent scans</h3>
       <ul>
         {''.join(scan_rows) if scan_rows else '<li>No scan jobs yet.</li>'}
       </ul>
+      <h3>Recent discovery scans</h3>
+      <ul>
+        {''.join(monitor_scan_rows) if monitor_scan_rows else '<li>No discovery scans yet.</li>'}
+      </ul>
+      <h3>Recent manual scans</h3>
+      <ul>
+        {''.join(manual_scan_rows) if manual_scan_rows else '<li>No manual scans yet.</li>'}
+      </ul>
     </section>
   </div>
+
+  <section class="card" style="margin-top: 1.5rem;">
+    <h2>Manual discovery scan</h2>
+    <p class="hint">Run a filtered scan for the selected Telegram user. Results appear below as the scan records matches.</p>
+    <form id="manual-scan-form">
+      <input type="hidden" name="user_id" value="{html.escape(str(selected_user_id_value))}">
+      <div class="inline-fields">
+        <label>Platform<input name="platform" value="myntra" required {"disabled" if selected_user is None else ""}></label>
+        <label>Brand names<input name="brands" placeholder="Adidas Originals, Nike" required {"disabled" if selected_user is None else ""}></label>
+        <label>UK sizes<input name="sizes" placeholder="UK 10, UK 11" required {"disabled" if selected_user is None else ""}></label>
+      </div>
+      <button type="submit" {"disabled" if selected_user is None else ""}>Start scan</button>
+    </form>
+    <div id="manual-scan-status" class="manual-scan-status hint">No manual scan running.</div>
+    <div id="manual-scan-grid" class="product-grid"></div>
+    <div class="pager" id="manual-scan-pager" style="display:none;">
+      <button type="button" id="manual-prev">Previous</button>
+      <span id="manual-page-label">Page 1 of 1</span>
+      <button type="button" id="manual-next">Next</button>
+    </div>
+  </section>
+
+  <section class="card" style="margin-top: 1.5rem;">
+    <h2>Discovery monitors</h2>
+    <p class="hint">Monitor brand/platform searches for selected sizes and record newly matched sneakers for admin review.</p>
+    <form method="post">
+      <input type="hidden" name="action" value="add_monitor">
+      <input type="hidden" name="user_id" value="{html.escape(str(selected_user_id_value))}">
+      <label>Platform<input name="monitor_platform" value="myntra" required {"disabled" if selected_user is None else ""}></label>
+      <label>Brand<input name="monitor_brand" placeholder="Adidas Originals" required {"disabled" if selected_user is None else ""}></label>
+      <label>Terms<input name="monitor_terms" placeholder="sneakers, samba" {"disabled" if selected_user is None else ""}></label>
+      <label>Sizes<input name="monitor_sizes" placeholder="10, 11" {"disabled" if selected_user is None else ""}></label>
+      <label>Minimum discount %<input name="monitor_min_discount" type="number" min="0" step="0.1" {"disabled" if selected_user is None else ""}></label>
+      <label>Maximum price<input name="monitor_max_price" type="number" min="0" step="0.01" {"disabled" if selected_user is None else ""}></label>
+      <label>Notes<textarea name="monitor_notes" rows="3" {"disabled" if selected_user is None else ""}></textarea></label>
+      <button type="submit" {"disabled" if selected_user is None else ""}>Add discovery monitor</button>
+    </form>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Platform</th>
+          <th>Brand</th>
+          <th>Terms</th>
+          <th>Sizes</th>
+          <th>Min discount</th>
+          <th>Max price</th>
+          <th>Status</th>
+          <th>Last scan</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(monitor_rows) if monitor_rows else '<tr><td colspan="10">No discovery monitors for the selected user.</td></tr>'}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card" style="margin-top: 1.5rem;">
+    <h2>Discovery results</h2>
+    <p class="hint">Recent products matched by discovery monitors. New means the monitor had not seen that product before.</p>
+    <table>
+      <thead>
+        <tr>
+          <th>User</th>
+          <th>Monitor</th>
+          <th>Product</th>
+          <th>Platform</th>
+          <th>Matched sizes</th>
+          <th>Price</th>
+          <th>Discount</th>
+          <th>New</th>
+          <th>Scan</th>
+          <th>Recorded</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(monitor_result_rows) if monitor_result_rows else '<tr><td colspan="10">No discovery results yet.</td></tr>'}
+      </tbody>
+    </table>
+  </section>
 
   <section class="card" style="margin-top: 1.5rem;">
     <h2>Price trends</h2>
@@ -559,6 +943,158 @@ def render_dashboard_template(
       </tbody>
     </table>
   </section>
+  <script>
+    const manualScanForm = document.getElementById('manual-scan-form');
+    const manualScanStatus = document.getElementById('manual-scan-status');
+    const manualScanGrid = document.getElementById('manual-scan-grid');
+    const manualScanPager = document.getElementById('manual-scan-pager');
+    const manualPrev = document.getElementById('manual-prev');
+    const manualNext = document.getElementById('manual-next');
+    const manualPageLabel = document.getElementById('manual-page-label');
+    let manualScanId = null;
+    let manualScanPage = 1;
+    let manualScanTotalPages = 1;
+    let manualScanPoll = null;
+
+    function money(value, currency) {{
+      if (value === null || value === undefined) return 'N/A';
+      const symbol = (currency || 'INR').toUpperCase() === 'INR' ? 'Rs ' : `${{currency}} `;
+      return symbol + Number(value).toLocaleString('en-IN', {{ maximumFractionDigits: 0 }});
+    }}
+
+    function setManualStatus(text) {{
+      manualScanStatus.textContent = text;
+    }}
+
+    function resultCard(result) {{
+      const card = document.createElement('article');
+      card.className = 'product-card';
+
+      const link = document.createElement('a');
+      link.href = result.product_url;
+      link.target = '_blank';
+      link.rel = 'noreferrer';
+
+      const img = document.createElement('img');
+      img.className = 'product-thumb';
+      img.alt = result.title;
+      img.src = result.image_url || '';
+      img.onerror = () => {{ img.style.display = 'none'; }};
+      link.appendChild(img);
+      card.appendChild(link);
+
+      const title = document.createElement('a');
+      title.className = 'product-title';
+      title.href = result.product_url;
+      title.target = '_blank';
+      title.rel = 'noreferrer';
+      title.textContent = result.title;
+      card.appendChild(title);
+
+      const meta = document.createElement('div');
+      meta.className = 'product-meta';
+      const sizes = result.matched_sizes && result.matched_sizes.length ? result.matched_sizes.join(', ') : 'N/A';
+      const discount = result.discount_percentage === null || result.discount_percentage === undefined ? '' : ` | ${{result.discount_percentage}}% off`;
+      meta.textContent = `${{result.platform}} | ${{money(result.current_price, result.currency)}}${{discount}} | sizes: ${{sizes}}`;
+      card.appendChild(meta);
+
+      const actions = document.createElement('div');
+      actions.className = 'product-actions';
+
+      const track = document.createElement('button');
+      track.type = 'button';
+      track.dataset.action = 'track';
+      track.dataset.resultId = result.id;
+      track.textContent = result.is_tracked ? 'Tracked' : 'Track';
+      track.disabled = Boolean(result.is_tracked);
+      actions.appendChild(track);
+
+      const ignore = document.createElement('button');
+      ignore.type = 'button';
+      ignore.className = 'danger';
+      ignore.dataset.action = 'ignore';
+      ignore.dataset.resultId = result.id;
+      ignore.textContent = 'Ignore';
+      actions.appendChild(ignore);
+
+      card.appendChild(actions);
+      return card;
+    }}
+
+    function renderManualResults(payload) {{
+      manualScanGrid.innerHTML = '';
+      payload.results.forEach((result) => manualScanGrid.appendChild(resultCard(result)));
+      manualScanPage = payload.page;
+      manualScanTotalPages = payload.total_pages;
+      manualPageLabel.textContent = `Page ${{payload.page}} of ${{payload.total_pages}}`;
+      manualPrev.disabled = payload.page <= 1;
+      manualNext.disabled = payload.page >= payload.total_pages;
+      manualScanPager.style.display = payload.total > 0 ? 'flex' : 'none';
+      const suffix = payload.status === 'running' ? ' Still scanning...' : '';
+      setManualStatus(`${{payload.status}} | found ${{payload.products_found}} | matched ${{payload.products_matched}}${{suffix}}`);
+    }}
+
+    async function loadManualResults(page = manualScanPage) {{
+      if (!manualScanId) return;
+      const response = await fetch(`/api/manual-scan/results?scan_id=${{manualScanId}}&page=${{page}}`);
+      const payload = await response.json();
+      if (!payload.ok) {{
+        setManualStatus(payload.error || 'Unable to load scan results.');
+        return;
+      }}
+      renderManualResults(payload);
+      if (payload.status === 'running') {{
+        clearTimeout(manualScanPoll);
+        manualScanPoll = setTimeout(() => loadManualResults(manualScanPage), 1500);
+      }}
+    }}
+
+    async function postManualAction(path, resultId) {{
+      const body = new URLSearchParams();
+      body.set('result_id', resultId);
+      const response = await fetch(path, {{ method: 'POST', body }});
+      const payload = await response.json();
+      if (!payload.ok) {{
+        setManualStatus(payload.error || 'Action failed.');
+        return;
+      }}
+      await loadManualResults(manualScanPage);
+    }}
+
+    if (manualScanForm) {{
+      manualScanForm.addEventListener('submit', async (event) => {{
+        event.preventDefault();
+        clearTimeout(manualScanPoll);
+        manualScanGrid.innerHTML = '';
+        manualScanPager.style.display = 'none';
+        setManualStatus('Starting scan...');
+        const response = await fetch('/api/manual-scan/start', {{
+          method: 'POST',
+          body: new FormData(manualScanForm),
+        }});
+        const payload = await response.json();
+        if (!payload.ok) {{
+          setManualStatus(payload.error || 'Unable to start scan.');
+          return;
+        }}
+        manualScanId = payload.scan_id;
+        manualScanPage = 1;
+        await loadManualResults(1);
+      }});
+    }}
+
+    manualScanGrid.addEventListener('click', async (event) => {{
+      const button = event.target.closest('button[data-action]');
+      if (!button) return;
+      button.disabled = true;
+      const action = button.dataset.action;
+      const resultId = button.dataset.resultId;
+      await postManualAction(`/api/manual-scan/${{action}}`, resultId);
+    }});
+
+    manualPrev.addEventListener('click', () => loadManualResults(Math.max(1, manualScanPage - 1)));
+    manualNext.addEventListener('click', () => loadManualResults(Math.min(manualScanTotalPages, manualScanPage + 1)));
+  </script>
 </body>
 </html>
 """
@@ -737,9 +1273,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_header(key, value)
         self.end_headers()
 
-    def _send_json(self, payload: dict):
+    def _send_json(self, payload: dict, status: int = 200):
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -835,12 +1371,174 @@ class DashboardHandler(BaseHTTPRequestHandler):
         finally:
             session.close()
 
+    def _open_authenticated_api_session(self):
+        """Return an authenticated session/user pair or send a JSON 401."""
+        session = self._open_session()
+        auth_result = get_authenticated_user(session, self.headers.get("Cookie"))
+        if auth_result is None:
+            session.close()
+            self._send_json({"ok": False, "error": "Authentication required."}, status=401)
+            return None, None
+        user, _auth_session = auth_result
+        return session, user
+
+    def _handle_manual_scan_start(self) -> None:
+        session, _admin_user = self._open_authenticated_api_session()
+        if session is None:
+            return
+
+        try:
+            data = self._read_form()
+            try:
+                selected_user_id = int(data.get("user_id", [""])[0])
+            except ValueError:
+                self._send_json({"ok": False, "error": "Select a Telegram user before scanning."}, status=400)
+                return
+
+            selected_user = UserRepository.get_by_id(session, selected_user_id)
+            if selected_user is None:
+                self._send_json({"ok": False, "error": "Selected Telegram user not found."}, status=404)
+                return
+
+            brands = parse_csv(data.get("brands", [""])[0]) or []
+            sizes = parse_csv(data.get("sizes", [""])[0]) or []
+            platform = (data.get("platform", ["myntra"])[0] or "myntra").strip().lower()
+            if not brands:
+                self._send_json({"ok": False, "error": "Enter at least one brand name."}, status=400)
+                return
+            if not sizes:
+                self._send_json({"ok": False, "error": "Enter at least one UK size."}, status=400)
+                return
+
+            scan = ManualDiscoveryScanRepository.create(
+                session,
+                user_id=selected_user.id,
+                platform=platform,
+                brand_filters=ManualDiscoveryService.serialize_values(brands),
+                size_filters=ManualDiscoveryService.serialize_values(sizes),
+            )
+            thread = threading.Thread(
+                target=ManualDiscoveryService.run_scan_sync,
+                args=(scan.id,),
+                daemon=True,
+            )
+            thread.start()
+            self._send_json({"ok": True, "scan_id": scan.id, "status": scan.status})
+        except Exception as exc:
+            logger.exception("manual_scan_start_failed", error=str(exc))
+            self._send_json({"ok": False, "error": str(exc)}, status=500)
+        finally:
+            session.close()
+
+    def _handle_manual_scan_results(self, query: dict[str, list[str]]) -> None:
+        session, _admin_user = self._open_authenticated_api_session()
+        if session is None:
+            return
+
+        try:
+            try:
+                scan_id = int(query.get("scan_id", [""])[0])
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid scan_id."}, status=400)
+                return
+
+            try:
+                page = int(query.get("page", ["1"])[0])
+            except ValueError:
+                page = 1
+
+            payload = build_manual_scan_payload(session, scan_id, page=page)
+            if payload is None:
+                self._send_json({"ok": False, "error": "Manual scan not found."}, status=404)
+                return
+
+            payload["ok"] = True
+            self._send_json(payload)
+        finally:
+            session.close()
+
+    def _handle_manual_scan_track(self) -> None:
+        session, _admin_user = self._open_authenticated_api_session()
+        if session is None:
+            return
+
+        try:
+            data = self._read_form()
+            try:
+                result_id = int(data.get("result_id", [""])[0])
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid result_id."}, status=400)
+                return
+
+            result = ManualDiscoveryResultRepository.get(session, result_id)
+            if result is None or result.product is None or result.scan is None:
+                self._send_json({"ok": False, "error": "Manual scan result not found."}, status=404)
+                return
+
+            product = result.product
+            size_scope = parse_json_list(result.matched_sizes) or parse_json_list(result.scan.size_filters)
+            platform_name = product.platform.name if product.platform else result.scan.platform
+            WishlistService.add_from_url(
+                session,
+                url=product.product_url,
+                brand=product.brand,
+                model_name=product.model_name,
+                title=product.title,
+                platforms_to_track=[platform_name],
+                size_scope=size_scope,
+                notes=f"Tracked from manual discovery scan #{result.scan_id}",
+                user_id=result.scan.user_id,
+            )
+            ManualDiscoveryResultRepository.set_tracked(session, result, True)
+            self._send_json({"ok": True, "result": build_manual_result_payload(result)})
+        except Exception as exc:
+            logger.exception("manual_scan_track_failed", error=str(exc))
+            self._send_json({"ok": False, "error": str(exc)}, status=500)
+        finally:
+            session.close()
+
+    def _handle_manual_scan_ignore(self) -> None:
+        session, admin_user = self._open_authenticated_api_session()
+        if session is None:
+            return
+
+        try:
+            data = self._read_form()
+            try:
+                result_id = int(data.get("result_id", [""])[0])
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid result_id."}, status=400)
+                return
+
+            result = ManualDiscoveryResultRepository.get(session, result_id)
+            if result is None or result.product is None:
+                self._send_json({"ok": False, "error": "Manual scan result not found."}, status=404)
+                return
+
+            ProductIgnoreRepository.ignore_product(
+                session,
+                result.product,
+                created_by_user_id=admin_user.id,
+                reason=f"Ignored from manual discovery scan #{result.scan_id}",
+            )
+            ManualDiscoveryResultRepository.set_ignored(session, result, True)
+            self._send_json({"ok": True})
+        except Exception as exc:
+            logger.exception("manual_scan_ignore_failed", error=str(exc))
+            self._send_json({"ok": False, "error": str(exc)}, status=500)
+        finally:
+            session.close()
+
     def do_GET(self):
         parsed_path = urlparse(self.path)
         query = parse_qs(parsed_path.query)
 
         if self.path == "/health":
             self._send_json({"status": "ok"})
+            return
+
+        if parsed_path.path == "/api/manual-scan/results":
+            self._handle_manual_scan_results(query)
             return
 
         if parsed_path.path == "/login":
@@ -900,6 +1598,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == "/api/manual-scan/start":
+            self._handle_manual_scan_start()
+            return
+
+        if parsed_path.path == "/api/manual-scan/track":
+            self._handle_manual_scan_track()
+            return
+
+        if parsed_path.path == "/api/manual-scan/ignore":
+            self._handle_manual_scan_ignore()
+            return
+
         if self.path == "/login":
             data = self._read_form()
             username = data.get("username", [""])[0]
@@ -1040,6 +1751,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         action = data.get("action", [""])[0]
 
         selected_user_id: int | None = None
+        flash = None
         session = self._open_session()
         try:
             auth_result = get_authenticated_user(session, self.headers.get("Cookie"))
@@ -1055,7 +1767,78 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     flash = "Invalid user selection."
 
-            if action == "add":
+            if action == "telegram_connectivity":
+                enabled = data.get("enabled", ["false"])[0].lower() == "true"
+                AppSettingRepository.set_telegram_connectivity_enabled(session, enabled)
+                flash = (
+                    "Telegram connectivity enabled."
+                    if enabled
+                    else "Telegram connectivity disabled."
+                )
+            elif action == "add_monitor":
+                if selected_user_id is None:
+                    flash = "Select a registered Telegram user before adding a discovery monitor."
+                else:
+                    selected_user = UserRepository.get_by_id(session, selected_user_id)
+                    if selected_user is None:
+                        flash = "Selected Telegram user not found."
+                    else:
+                        monitor = BrandMonitorService.add_monitor(
+                            session,
+                            user_id=selected_user.id,
+                            platform=data.get("monitor_platform", ["myntra"])[0],
+                            brand=data.get("monitor_brand", [""])[0],
+                            query_terms=parse_csv(data.get("monitor_terms", [None])[0]),
+                            size_scope=parse_csv(data.get("monitor_sizes", [None])[0]),
+                            min_discount_percentage=parse_optional_float(
+                                data.get("monitor_min_discount", [None])[0]
+                            ),
+                            max_price=parse_optional_float(
+                                data.get("monitor_max_price", [None])[0]
+                            ),
+                            notes=data.get("monitor_notes", [""])[0] or None,
+                        )
+                        flash = (
+                            f"Discovery monitor #{monitor.id} added for "
+                            f"{selected_user.display_name or selected_user.username}."
+                        )
+            elif action == "toggle_monitor":
+                if selected_user_id is None:
+                    flash = "Invalid user selection."
+                else:
+                    monitor_id = int(data.get("monitor_id", ["0"])[0])
+                    monitor = BrandMonitorRepository.get_for_user(
+                        session,
+                        selected_user_id,
+                        monitor_id,
+                    )
+                    if monitor is None:
+                        flash = "Discovery monitor not found."
+                    else:
+                        enabled = data.get("enabled", ["false"])[0].lower() == "true"
+                        BrandMonitorRepository.set_active(session, monitor, enabled)
+                        flash = (
+                            "Discovery monitor resumed."
+                            if enabled
+                            else "Discovery monitor paused."
+                        )
+            elif action == "delete_monitor":
+                if selected_user_id is None:
+                    flash = "Invalid user selection."
+                else:
+                    monitor_id = int(data.get("monitor_id", ["0"])[0])
+                    monitor = BrandMonitorRepository.get_for_user(
+                        session,
+                        selected_user_id,
+                        monitor_id,
+                    )
+                    if monitor is None:
+                        flash = "Discovery monitor not found."
+                    else:
+                        session.delete(monitor)
+                        session.commit()
+                        flash = "Discovery monitor deleted."
+            elif action == "add":
                 if selected_user_id is None:
                     flash = "Select a registered Telegram user before adding an item."
                 else:

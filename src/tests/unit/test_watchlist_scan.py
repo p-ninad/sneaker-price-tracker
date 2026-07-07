@@ -256,6 +256,10 @@ class TestWatchlistScan:
 
         scheduler = ScanScheduler(CollectorRegistry())
         scheduler.registry.register(collector)
+        scheduler.notification_service.send_scan_summary = AsyncMock(return_value=True)
+        scheduler.notification_service.process_unnotified_alerts = AsyncMock(
+            return_value={"sent_count": 0, "failed_count": 0}
+        )
 
         import asyncio
 

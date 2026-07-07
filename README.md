@@ -73,11 +73,11 @@ make run
 # Build image
 make docker-build
 
-# Start with docker-compose (includes reverse proxy + auth)
+# Start with docker-compose (reverse proxy + auth + one-shot migrations)
 make docker-run
 
-# Apply database migrations when using Postgres
-make db-migrate
+# Rerun migrations without restarting the stack
+make docker-migrate
 
 # View logs
 make docker-logs
@@ -96,7 +96,7 @@ After starting with `docker-compose`, the dashboard is available at:
 - **Local**: `http://localhost`
 - **Via reverse proxy**: The dashboard is only exposed through the Caddy reverse proxy (port 80/443), not directly
 - **First-time setup**: Open `http://localhost/bootstrap` and create the first admin account using `AUTH_BOOTSTRAP_TOKEN`
-- **Postgres**: The compose stack now brings up a Postgres container and runs the app against `DATABASE_URL=postgresql+psycopg://...`
+- **Postgres**: The compose stack connects to a persistent PostgreSQL service running on the host. See `docs/EXTERNAL_POSTGRES.md` for service, pgAdmin, and `pg_hba.conf` setup.
 
 #### Authentication
 
@@ -168,17 +168,20 @@ Use `.env.example` as the template for local development and fill in the values 
 
 For Docker or a VPS, prefer exporting secrets directly in the runtime environment or mounting them from a secure file. The app will load `.env` automatically when it exists, otherwise it falls back to environment variables only.
 
-For Postgres deployments, set `DATABASE_URL` to a `postgresql+psycopg://...` URL and run `make db-migrate` before starting the app.
+For Postgres deployments, run PostgreSQL on the host, set the `POSTGRES_*` values used by Compose, and let the `database-migrate` service apply migrations before the app starts. See `docs/EXTERNAL_POSTGRES.md` for the full setup.
 
 Example environment variables:
 
 ```env
 ENV=production
 LOG_LEVEL=INFO
-DATABASE_URL=postgresql+psycopg://price_tracker:changeme@postgres:5432/price_tracker
+DATABASE_URL=postgresql+psycopg://price_tracker:changeme@127.0.0.1:5432/price_tracker
 POSTGRES_DB=price_tracker
 POSTGRES_USER=price_tracker
 POSTGRES_PASSWORD=changeme
+POSTGRES_HOST=host.docker.internal
+POSTGRES_PORT=5432
+DOCKER_SUBNET=172.30.0.0/24
 OPENAI_API_KEY=sk-...
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 TELEGRAM_CHAT_ID=987654321

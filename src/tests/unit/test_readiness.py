@@ -67,6 +67,32 @@ def test_main_and_bot_readiness_require_telegram_credentials(monkeypatch):
     assert "TELEGRAM_BOT_TOKEN is required" in bot_report.render()
 
 
+def test_telegram_readiness_passes_when_connectivity_disabled(monkeypatch):
+    import app.readiness as readiness
+
+    monkeypatch.setattr(readiness, "_check_database", lambda: _stub_check("database"))
+    monkeypatch.setattr(readiness, "get_session", lambda: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(
+        readiness.AppSettingRepository,
+        "telegram_connectivity_enabled",
+        lambda session: False,
+    )
+
+    readiness.config.settings = SimpleNamespace(
+        auth_bootstrap_token="token",
+        telegram_bot_token=None,
+        telegram_chat_id=None,
+    )
+
+    main_report = readiness.build_readiness_report("main")
+    bot_report = readiness.build_readiness_report("telegram-bot")
+
+    assert main_report.ok
+    assert "Telegram connectivity disabled" in main_report.render()
+    assert bot_report.ok
+    assert "Telegram connectivity disabled" in bot_report.render()
+
+
 def test_all_readiness_aggregates_checks(monkeypatch):
     import app.readiness as readiness
 
@@ -83,4 +109,3 @@ def test_all_readiness_aggregates_checks(monkeypatch):
 
     assert report.ok
     assert len(report.checks) == 4
-

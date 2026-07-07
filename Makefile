@@ -2,7 +2,7 @@
 
 SERVICE ?= all
 
-.PHONY: help install run dev dashboard ready test lint format clean docker-build docker-run docker-stop init db-reset db-migrate
+.PHONY: help install run dev dashboard ready test lint format clean docker-build docker-run docker-stop docker-migrate init db-reset db-migrate
 
 help:
 	@echo "Price Tracker Makefile"
@@ -11,7 +11,7 @@ help:
 	@echo "Commands:"
 	@echo "  make install       - Install dependencies"
 	@echo "  make init          - Initialize database"
-	@echo "  make db-reset      - Drop and recreate database schema"
+	@echo "  make db-reset      - Drop and recreate local SQLite schema"
 	@echo "  make run           - Run the application"
 	@echo "  make dev           - Run in development mode with auto-reload"
 	@echo "  make ready         - Run deploy-time readiness checks (SERVICE=all|dashboard|main|telegram-bot)"
@@ -22,12 +22,13 @@ help:
 	@echo "  make docker-build  - Build Docker image"
 	@echo "  make docker-run    - Start Docker container"
 	@echo "  make docker-stop   - Stop Docker container"
+	@echo "  make docker-migrate - Apply migrations through Docker"
 	@echo "  make db-migrate    - Apply database migrations"
 	@echo ""
 
 install:
 	pip install -r requirements.txt
-	playwright install
+	PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1 playwright install
 
 init:
 	export PYTHONPATH=./src && python3 -m app.database.bootstrap
@@ -86,6 +87,9 @@ docker-logs:
 
 docker-shell:
 	docker compose exec price-tracker bash
+
+docker-migrate:
+	docker compose run --rm database-migrate
 
 # Development utilities
 db-migrate:

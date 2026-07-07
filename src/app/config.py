@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     telegram_require_chat_id: bool = Field(
         default=True, alias="TELEGRAM_REQUIRE_CHAT_ID"
     )
+    telegram_connectivity_enabled: bool = Field(
+        default=True, alias="TELEGRAM_CONNECTIVITY_ENABLED"
+    )
 
     # === Scraping ===
     playwright_headless: bool = Field(default=True, alias="PLAYWRIGHT_HEADLESS")
@@ -57,6 +60,8 @@ class Settings(BaseSettings):
 
     # === Scheduler ===
     enable_scheduler: bool = Field(default=True, alias="ENABLE_SCHEDULER")
+    scan_on_startup: bool = Field(default=False, alias="SCAN_ON_STARTUP")
+    enable_catalog_scan: bool = Field(default=False, alias="ENABLE_CATALOG_SCAN")
     catalog_scan_interval_hours: int = Field(
         default=6, alias="CATALOG_SCAN_INTERVAL_HOURS"
     )
@@ -65,6 +70,12 @@ class Settings(BaseSettings):
     )
     hot_items_scan_interval_minutes: int = Field(
         default=15, alias="HOT_ITEMS_SCAN_INTERVAL_MINUTES"
+    )
+    brand_monitor_scan_interval_minutes: int = Field(
+        default=15, alias="BRAND_MONITOR_SCAN_INTERVAL_MINUTES"
+    )
+    brand_monitor_result_limit: int = Field(
+        default=50, alias="BRAND_MONITOR_RESULT_LIMIT"
     )
 
     # === Platforms ===
@@ -98,6 +109,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_secret_configuration(self):
         """Fail fast when the runtime configuration is internally inconsistent."""
+        if not self.telegram_connectivity_enabled:
+            return self
+
         if self.telegram_chat_id and not self.telegram_bot_token:
             raise ValueError("TELEGRAM_BOT_TOKEN must be set when TELEGRAM_CHAT_ID is set.")
 

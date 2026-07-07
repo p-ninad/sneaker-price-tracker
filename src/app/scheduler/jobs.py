@@ -11,6 +11,10 @@ from app.utils.logger import get_logger
 from app.database.db import get_session
 from app.database.models import Product
 from app.database.repository import (
+    BrandMonitorRepository,
+    BrandMonitorScanRepository,
+    BrandMonitorScanResultRepository,
+    BrandMonitorSeenProductRepository,
     PlatformRepository,
     PriceSnapshotRepository,
     ProductRepository,
@@ -19,6 +23,7 @@ from app.database.repository import (
 )
 from app.collectors.base import CollectorRegistry
 from app.notifier.telegram import NotificationService
+from app.services.brand_monitor import BrandMonitorService
 from app.services.tracking import TrackingService
 from app.services.wishlist import WishlistService
 from app.utils.url_parser import extract_product_id_from_url
@@ -48,7 +53,10 @@ class ScanScheduler:
         logger.info("Starting scheduler")
 
         # Register jobs
-        self._register_catalog_scan()
+        if settings.enable_catalog_scan:
+            self._register_catalog_scan()
+        else:
+            logger.info("Catalog scan disabled; use dashboard manual discovery scans")
         self._register_watchlist_scan()
         self._register_hot_items_scan()
 
@@ -71,7 +79,7 @@ class ScanScheduler:
             name="Catalog Scan",
             replace_existing=True,
             max_instances=1,
-            next_run_time=datetime.utcnow(),
+            next_run_time=datetime.utcnow() if settings.scan_on_startup else None,
         )
         logger.info(
             f"Registered catalog scan (every {settings.catalog_scan_interval_hours}h)"
@@ -86,7 +94,7 @@ class ScanScheduler:
             name="Watchlist Scan",
             replace_existing=True,
             max_instances=1,
-            next_run_time=datetime.utcnow(),
+            next_run_time=datetime.utcnow() if settings.scan_on_startup else None,
         )
         logger.info(
             f"Registered watchlist scan (every {settings.watchlist_scan_interval_hours}h)"
@@ -96,15 +104,16 @@ class ScanScheduler:
         """Register hot items scan job."""
         self.scheduler.add_job(
             self._run_hot_items_scan,
-            trigger=IntervalTrigger(minutes=settings.hot_items_scan_interval_minutes),
-            id="hot_items_scan",
-            name="Hot Items Scan",
+            trigger=IntervalTrigger(minutes=settings.brand_monitor_scan_interval_minutes),
+            id="brand_monitor_scan",
+            name="Brand Monitor Scan",
             replace_existing=True,
             max_instances=1,
-            next_run_time=datetime.utcnow(),
+            next_run_time=datetime.utcnow() if settings.scan_on_startup else None,
         )
         logger.info(
-            f"Registered hot items scan (every {settings.hot_items_scan_interval_minutes}m)"
+            "Registered brand monitor scan "
+            f"(every {settings.brand_monitor_scan_interval_minutes}m)"
         )
 
     def _run_catalog_scan(self) -> None:
@@ -290,6 +299,7 @@ class ScanScheduler:
             title=product_data.title,
             listed_price=product_data.listed_price,
             discounted_price=product_data.discounted_price,
+            discount_percentage=product_data.discount_percentage,
             currency=product_data.currency,
             in_stock=product_data.in_stock,
             sizes_available=(
@@ -367,15 +377,15 @@ class ScanScheduler:
             active_entries = WishlistService.get_active(session)
             if not active_entries:
                 logger.info("No active wishlist entries found")
-                if self.notification_service.notifier:
-                    await self.notification_service.send_scan_summary(
-                        scan_type="watchlist",
-                        entries_scanned=0,
-                        products_updated=0,
-                        alerts_created=0,
-                        mismatches=[],
-                        errors=["No active wishlist entries found"],
-                    )
+                await self.notification_service.send_scan_summary(
+                    scan_type="watchlist",
+                    entries_scanned=0,
+                    products_updated=0,
+                    alerts_created=0,
+                    mismatches=[],
+                    errors=["No active wishlist entries found"],
+                    session=session,
+                )
                 return
 
             scanned_keys = set()
@@ -452,6 +462,7 @@ class ScanScheduler:
                                         actual=ScanScheduler._normalize_text(
                                             f"{product_data.brand} {product_data.model_name}"
                                         ),
+                                        session=session,
                                     )
 
                                 result = await self._process_wishlist_product(
@@ -523,6 +534,7 @@ class ScanScheduler:
                                 actual=ScanScheduler._normalize_text(
                                     f"{product_data.brand} {product_data.model_name}"
                                 ),
+                                session=session,
                             )
 
                         result = await self._process_wishlist_product(
@@ -557,15 +569,15 @@ class ScanScheduler:
                 alerts_created=alerts_created,
                 size_skipped=size_skipped,
             )
-            if self.notification_service.notifier:
-                await self.notification_service.send_scan_summary(
-                    scan_type="watchlist",
-                    entries_scanned=entries_scanned,
-                    products_updated=products_updated,
-                    alerts_created=alerts_created,
-                    mismatches=list(dict.fromkeys(mismatches)),
-                    errors=list(dict.fromkeys(errors)),
-                )
+            await self.notification_service.send_scan_summary(
+                scan_type="watchlist",
+                entries_scanned=entries_scanned,
+                products_updated=products_updated,
+                alerts_created=alerts_created,
+                mismatches=list(dict.fromkeys(mismatches)),
+                errors=list(dict.fromkeys(errors)),
+                session=session,
+            )
 
             try:
                 dispatch_result = await self.notification_service.process_unnotified_alerts(
@@ -590,13 +602,167 @@ class ScanScheduler:
         asyncio.run(self._async_hot_items_scan())
 
     async def _async_hot_items_scan(self) -> None:
-        """Async hot items scan implementation."""
-        logger.info("Starting hot items scan")
+        """Async launch/brand monitor scan implementation."""
+        logger.info("Starting brand monitor scan")
         session = get_session()
 
         try:
-            # TODO: Implement hot items-specific scan
-            logger.info("Hot items scan not yet implemented")
+            monitors = BrandMonitorRepository.list_active(session)
+            if not monitors:
+                logger.info("No active brand monitors found")
+                return
+
+            total_new_products = 0
+            total_matched_products = 0
+            total_errors: list[str] = []
+
+            for monitor in monitors:
+                collector = self.registry.get(monitor.platform)
+                query = BrandMonitorService.build_discovery_query(monitor)
+                scan = BrandMonitorScanRepository.create(
+                    session,
+                    monitor_id=monitor.id,
+                    query=query,
+                )
+
+                errors: list[str] = []
+                new_product_messages: list[dict[str, object]] = []
+                products_found = 0
+                products_matched = 0
+
+                try:
+                    if collector is None:
+                        raise ValueError(f"No collector registered for {monitor.platform}")
+
+                    response = await collector.discover_products(
+                        query=query,
+                        limit=settings.brand_monitor_result_limit,
+                    )
+                    products_found = response.products_count
+                    if not response.success:
+                        raise ValueError(response.error_message or "discovery failed")
+
+                    seen_platform_ids: set[str] = set()
+                    for product_data in response.products:
+                        source_key = product_data.platform_product_id or product_data.product_url
+                        if source_key in seen_platform_ids:
+                            continue
+                        seen_platform_ids.add(source_key)
+
+                        matches, matched_sizes = BrandMonitorService.product_matches_monitor(
+                            monitor,
+                            product_data,
+                        )
+                        if not matches:
+                            continue
+
+                        product = BrandMonitorService.upsert_scanned_product(
+                            session,
+                            platform_name=collector.platform_name,
+                            platform_base_url=collector.base_url,
+                            product_data=product_data,
+                        )
+                        products_matched += 1
+
+                        _seen, is_new = BrandMonitorSeenProductRepository.upsert(
+                            session,
+                            monitor_id=monitor.id,
+                            product_id=product.id,
+                            scan_id=scan.id,
+                        )
+                        BrandMonitorScanResultRepository.create(
+                            session,
+                            scan_id=scan.id,
+                            monitor_id=monitor.id,
+                            product_id=product.id,
+                            is_new=is_new,
+                            matched_sizes=json.dumps(matched_sizes) if matched_sizes else None,
+                            current_price=BrandMonitorService.current_price(product),
+                            discount_percentage=product.discount_percentage,
+                        )
+
+                        if is_new:
+                            new_product_messages.append(
+                                {
+                                    "title": product.title,
+                                    "brand": product.brand,
+                                    "model_name": product.model_name,
+                                    "url": product.product_url,
+                                    "current_price": BrandMonitorService.current_price(product),
+                                    "discount_percentage": product.discount_percentage,
+                                    "matched_sizes": matched_sizes,
+                                }
+                            )
+
+                    BrandMonitorRepository.mark_scanned(session, monitor)
+                    BrandMonitorScanRepository.mark_complete(
+                        session,
+                        scan,
+                        status="success",
+                        products_found=products_found,
+                        products_matched=products_matched,
+                        new_products=len(new_product_messages),
+                    )
+
+                    total_new_products += len(new_product_messages)
+                    total_matched_products += products_matched
+                    chat_id = monitor.owner.telegram_chat_id if monitor.owner else None
+                    if chat_id:
+                        await self.notification_service.send_brand_monitor_update(
+                            chat_id=chat_id,
+                            monitor_title=BrandMonitorService.describe_monitor(monitor),
+                            platform=monitor.platform,
+                            query=query,
+                            products_found=products_found,
+                            products_matched=products_matched,
+                            new_products=new_product_messages,
+                            errors=[],
+                            session=session,
+                        )
+                except Exception as exc:
+                    error_message = str(exc)
+                    errors.append(error_message)
+                    total_errors.append(
+                        f"Monitor #{monitor.id} {monitor.brand} on {monitor.platform}: "
+                        f"{error_message}"
+                    )
+                    logger.error(
+                        "Brand monitor scan failed",
+                        monitor_id=monitor.id,
+                        platform=monitor.platform,
+                        brand=monitor.brand,
+                        error=error_message,
+                    )
+                    BrandMonitorScanRepository.mark_complete(
+                        session,
+                        scan,
+                        status="failed",
+                        products_found=products_found,
+                        products_matched=products_matched,
+                        new_products=0,
+                        errors=json.dumps(errors),
+                    )
+                    chat_id = monitor.owner.telegram_chat_id if monitor.owner else None
+                    if chat_id:
+                        await self.notification_service.send_brand_monitor_update(
+                            chat_id=chat_id,
+                            monitor_title=BrandMonitorService.describe_monitor(monitor),
+                            platform=monitor.platform,
+                            query=query,
+                            products_found=products_found,
+                            products_matched=products_matched,
+                            new_products=[],
+                            errors=errors,
+                            session=session,
+                        )
+
+            logger.info(
+                "Brand monitor scan completed",
+                monitors=len(monitors),
+                products_matched=total_matched_products,
+                new_products=total_new_products,
+                errors=len(total_errors),
+            )
         finally:
             session.close()
 

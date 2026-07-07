@@ -1,36 +1,22 @@
-services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: price-tracker-postgres
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-price_tracker}
-      POSTGRES_USER: ${POSTGRES_USER:-price_tracker}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
-    tmpfs:
-      - /var/lib/postgresql/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-price_tracker} -d ${POSTGRES_DB:-price_tracker}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    networks:
-      - price-tracker-net
+x-database-url: &database-url postgresql+psycopg://${POSTGRES_USER:-price_tracker}:${POSTGRES_PASSWORD:-changeme}@${POSTGRES_HOST:-host.docker.internal}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-price_tracker}
+x-host-postgres: &host-postgres
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
 
-  database-bootstrap:
+services:
+
+  database-migrate:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: price-tracker-database-bootstrap
-    command: ["python", "-m", "app.database.bootstrap", "--reset"]
-    depends_on:
-      postgres:
-        condition: service_healthy
+    container_name: price-tracker-database-migrate
+    command: ["python", "-m", "app.migrations", "upgrade", "head"]
     environment:
       ENV: production
       LOG_LEVEL: INFO
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-price_tracker}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-price_tracker}
+      DATABASE_URL: *database-url
     restart: "no"
+    <<: *host-postgres
     networks:
       - price-tracker-net
 
@@ -40,20 +26,22 @@ services:
       dockerfile: Dockerfile
     container_name: price-tracker
     depends_on:
-      postgres:
-        condition: service_healthy
-      database-bootstrap:
+      database-migrate:
         condition: service_completed_successfully
     environment:
       ENV: production
       LOG_LEVEL: DEBUG
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-price_tracker}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-price_tracker}
+      DATABASE_URL: *database-url
       PLAYWRIGHT_HEADLESS: "true"
       ENABLE_SCHEDULER: "true"
+      SCAN_ON_STARTUP: ${SCAN_ON_STARTUP:-false}
+      ENABLE_CATALOG_SCAN: ${ENABLE_CATALOG_SCAN:-false}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_CONNECTIVITY_ENABLED: ${TELEGRAM_CONNECTIVITY_ENABLED:-true}
     restart: unless-stopped
+    <<: *host-postgres
     healthcheck:
       test: ["CMD", "python", "-m", "app.readiness", "--service", "main"]
       interval: 30s
@@ -75,16 +63,16 @@ services:
     container_name: price-tracker-dashboard
     command: ["python", "-m", "app.dashboard", "--host", "0.0.0.0", "--port", "8000"]
     depends_on:
-      postgres:
-        condition: service_healthy
-      database-bootstrap:
+      database-migrate:
         condition: service_completed_successfully
     environment:
       ENV: production
       LOG_LEVEL: INFO
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-price_tracker}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-price_tracker}
+      DATABASE_URL: *database-url
       AUTH_BOOTSTRAP_TOKEN: ${AUTH_BOOTSTRAP_TOKEN:-changeme-in-production}
+      TELEGRAM_CONNECTIVITY_ENABLED: ${TELEGRAM_CONNECTIVITY_ENABLED:-true}
     restart: unless-stopped
+    <<: *host-postgres
     healthcheck:
       test: ["CMD", "python", "-m", "app.readiness", "--service", "dashboard"]
       interval: 30s
@@ -108,17 +96,17 @@ services:
     container_name: price-tracker-telegram-bot
     command: ["python", "-m", "app.bot.main"]
     depends_on:
-      postgres:
-        condition: service_healthy
-      database-bootstrap:
+      database-migrate:
         condition: service_completed_successfully
     environment:
       ENV: production
       LOG_LEVEL: INFO
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-price_tracker}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-price_tracker}
+      DATABASE_URL: *database-url
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_REQUIRE_CHAT_ID: "false"
+      TELEGRAM_CONNECTIVITY_ENABLED: ${TELEGRAM_CONNECTIVITY_ENABLED:-true}
     restart: unless-stopped
+    <<: *host-postgres
     healthcheck:
       test: ["CMD", "python", "-m", "app.readiness", "--service", "telegram-bot"]
       interval: 30s
@@ -162,3 +150,6 @@ volumes:
 networks:
   price-tracker-net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: ${DOCKER_SUBNET:-172.30.0.0/24}

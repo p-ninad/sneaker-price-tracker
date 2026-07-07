@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import app.config as config
 from app.database.db import get_session, init_db
-from app.database.repository import UserRepository
+from app.database.repository import AppSettingRepository, UserRepository
 from app.utils.logger import get_logger, setup_logging
 
 logger = get_logger(__name__)
@@ -54,14 +54,14 @@ def _check_database() -> ReadinessCheck:
         return ReadinessCheck(
             name="database",
             ok=True,
-            message="Database initialized successfully",
+            message="Database is reachable and ready",
         )
     except Exception as exc:
         logger.error("readiness_database_failed", error=str(exc))
         return ReadinessCheck(
             name="database",
             ok=False,
-            message=f"Database initialization failed: {exc}",
+            message=f"Database readiness failed: {exc}",
         )
 
 
@@ -100,6 +100,22 @@ def _check_dashboard() -> ReadinessCheck:
 
 
 def _check_main() -> ReadinessCheck:
+    session = get_session()
+    try:
+        telegram_enabled = AppSettingRepository.telegram_connectivity_enabled(session)
+    except Exception as exc:
+        logger.warning("readiness_telegram_setting_failed", error=str(exc))
+        telegram_enabled = getattr(config.settings, "telegram_connectivity_enabled", True)
+    finally:
+        session.close()
+
+    if not telegram_enabled:
+        return ReadinessCheck(
+            name="main",
+            ok=True,
+            message="Telegram connectivity disabled by admin setting",
+        )
+
     if not config.settings.telegram_bot_token or not config.settings.telegram_chat_id:
         return ReadinessCheck(
             name="main",
@@ -115,6 +131,22 @@ def _check_main() -> ReadinessCheck:
 
 
 def _check_bot() -> ReadinessCheck:
+    session = get_session()
+    try:
+        telegram_enabled = AppSettingRepository.telegram_connectivity_enabled(session)
+    except Exception as exc:
+        logger.warning("readiness_telegram_setting_failed", error=str(exc))
+        telegram_enabled = getattr(config.settings, "telegram_connectivity_enabled", True)
+    finally:
+        session.close()
+
+    if not telegram_enabled:
+        return ReadinessCheck(
+            name="telegram-bot",
+            ok=True,
+            message="Telegram connectivity disabled by admin setting",
+        )
+
     if not config.settings.telegram_bot_token:
         return ReadinessCheck(
             name="telegram-bot",
